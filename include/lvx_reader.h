@@ -6,6 +6,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -105,6 +106,7 @@ public:
     void setSpeed(double speed);
     void pause();
     void resume();
+    bool seekToTimeNs(uint64_t time_ns);
     void stop();
     bool isOpen() const { return file_.is_open(); }
     bool isPlaying() const { return playing_; }
@@ -123,6 +125,7 @@ public:
 private:
     void playbackThread();
     bool readFrame();
+    bool sleepInterruptible(std::chrono::milliseconds duration);
     LvxFrameParseResult parseFrameData(const std::vector<uint8_t>& data,
                                        bool reset_base_time);
     void parseFrameData(const std::vector<uint8_t>& data,
@@ -136,6 +139,8 @@ private:
     uint64_t current_frame_;
     uint32_t frame_duration_ms_;
     uint64_t next_read_offset_;  // file offset for next readFrame call
+    std::vector<uint64_t> frame_offsets_;
+    double playback_time_offset_sec_{0.0};
     uint64_t base_time_ns_;      // first packet timestamp (ns) for time alignment
     bool     has_base_time_;
     bool     seen_points_;
@@ -154,6 +159,7 @@ private:
     std::atomic<double> playback_speed_{1.0};
 
     LidarFrameCallback frame_cb_;
+    std::mutex control_mutex_;
     std::mutex pause_mutex_;
     std::condition_variable pause_cv_;
 };

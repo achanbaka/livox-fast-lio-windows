@@ -282,6 +282,7 @@ bool LvxReader::open(const std::string& filepath)
 
     // ── First pass: count valid non-empty frames by following offsets ──
     total_frames_ = 0;
+    frame_offsets_.clear();
     const uint64_t first_frame_offset = static_cast<uint64_t>(file_.tellg());
     file_.seekg(0, std::ios::end);
     const uint64_t file_size = static_cast<uint64_t>(file_.tellg());
@@ -314,6 +315,7 @@ bool LvxReader::open(const std::string& filepath)
             break;
         }
 
+        frame_offsets_.push_back(current_pos);
         total_frames_++;
         current_pos = fh.next_offset;
     }
@@ -333,6 +335,7 @@ bool LvxReader::open(const std::string& filepath)
     eof_ = false;
     base_time_ns_ = 0;
     has_base_time_ = false;
+    playback_time_offset_sec_ = 0.0;
     seen_points_ = false;
     seen_imu_ = false;
     unsupported_packet_count_ = 0;
@@ -366,17 +369,47 @@ void LvxReader::play(double speed)
 void LvxReader::setSpeed(double speed)
 {
     playback_speed_ = speed;
+    pause_cv_.notify_all();
 }
 
 void LvxReader::pause()
 {
     paused_ = true;
+    pause_cv_.notify_all();
 }
 
 void LvxReader::resume()
 {
     paused_ = false;
     pause_cv_.notify_all();
+}
+
+bool LvxReader::seekToTimeNs(uint64_t time_ns)
+{
+    if (!file_.is_open() || frame_offsets_.empty()) {
+        return false;
+    }
+
+    const uint64_t frame_duration_ns =
+        std::max<uint64_t>(1, static_cast<uint64_t>(frame_duration_ms_) * 1000000ULL);
+    uint64_t target_frame = time_ns / frame_duration_ns;
+    if (target_frame >= frame_offsets_.size()) {
+        target_frame = frame_offsets_.size() - 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        file_.clear();
+        current_frame_ = target_frame;
+        next_read_offset_ = frame_offsets_[static_cast<size_t>(target_frame)];
+        eof_ = false;
+        base_time_ns_ = 0;
+        has_base_time_ = false;
+        playback_time_offset_sec_ = static_cast<double>(target_frame * frame_duration_ns) / 1e9;
+    }
+
+    pause_cv_.notify_all();
+    return true;
 }
 
 void LvxReader::stop()
@@ -407,7 +440,6 @@ void LvxReader::playbackThread()
             eof_ = true;
             break;
         }
-        current_frame_++;
 
         // Throttle: sleep for frame_duration minus time spent reading
         auto now = std::chrono::steady_clock::now();
@@ -418,7 +450,9 @@ void LvxReader::playbackThread()
         double sleep_ms = target_frame_ms - read_time;
         if (sleep_ms > 1.0 && sleep_ms < 500.0)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds((int)sleep_ms));
+            if (!sleepInterruptible(std::chrono::milliseconds((int)sleep_ms))) {
+                break;
+            }
         }
         last_frame_wall = std::chrono::steady_clock::now();
     }
@@ -446,8 +480,23 @@ void LvxReader::playbackThread()
     }
 }
 
+bool LvxReader::sleepInterruptible(std::chrono::milliseconds duration)
+{
+    std::unique_lock<std::mutex> lock(pause_mutex_);
+    pause_cv_.wait_for(lock, duration);
+    return !stop_flag_.load();
+}
+
 bool LvxReader::readFrame()
 {
+    std::vector<LvxPoint> points;
+    std::vector<ImuData> imus;
+    double frame_time = 0.0;
+    uint64_t data_size = 0;
+    uint64_t frame_number = 0;
+
+    {
+    std::lock_guard<std::mutex> control_lock(control_mutex_);
     // Seek to the expected frame position
     file_.clear();
     file_.seekg(next_read_offset_);
@@ -470,8 +519,7 @@ bool LvxReader::readFrame()
     next_read_offset_ = fh.next_offset;
 
     // Calculate frame data size
-    uint64_t data_start = file_.tellg();
-    uint64_t data_size = fh.next_offset - fh.current_offset - sizeof(LvxFrameHeader);
+    data_size = fh.next_offset - fh.current_offset - sizeof(LvxFrameHeader);
 
     if (fh.next_offset < fh.current_offset + sizeof(LvxFrameHeader) ||
         data_size > 10 * 1024 * 1024) // sanity check: max 10MB
@@ -497,15 +545,21 @@ bool LvxReader::readFrame()
     }
 
     // Parse frame data into points and IMU samples
-    std::vector<LvxPoint> points;
-    std::vector<ImuData> imus;
-    double frame_time = 0.0;
     parseFrameData(frame_data, base_time_ns_, frame_time, points, imus);
+    if (playback_time_offset_sec_ > 0.0) {
+        frame_time += playback_time_offset_sec_;
+        for (auto& imu : imus) {
+            imu.timestamp += playback_time_offset_sec_;
+        }
+    }
+    frame_number = current_frame_;
+    current_frame_++;
+    }
 
     // Log first few frames
-    if (current_frame_ < 3)
+    if (frame_number < 3)
     {
-        std::cout << "[LvxReader] Frame " << current_frame_
+        std::cout << "[LvxReader] Frame " << frame_number
                   << " data_size=" << data_size
                   << " pts=" << points.size()
                   << " imu=" << imus.size()
@@ -514,9 +568,9 @@ bool LvxReader::readFrame()
             std::cout << " pt0=(" << points[0].x << "," << points[0].y << "," << points[0].z << ")";
         std::cout << std::endl;
     }
-    else if (current_frame_ % 200 == 0)
+    else if (frame_number % 200 == 0)
     {
-        std::cout << "[LvxReader] Frame " << current_frame_
+        std::cout << "[LvxReader] Frame " << frame_number
                   << "/" << total_frames_
                   << " pts=" << points.size()
                   << " imu=" << imus.size() << std::endl;

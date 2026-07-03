@@ -361,3 +361,12 @@ void FoxglovePublisher::broadcastPlaybackState(const PlaybackState& state) {
     }
     impl->server->broadcastPlaybackState(toSdkPlaybackState(state));
 }
+
+void FoxglovePublisher::clearSession() {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
+    auto* impl = getImpl(server_impl_);
+    if (!impl || !impl->server || !running_) {
+        return;
+    }
+    (void)impl->server->clearSession();
+}

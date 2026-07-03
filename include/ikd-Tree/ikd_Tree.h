@@ -297,6 +297,7 @@ public:
     void Set_balance_criterion_param(float balance_param) { balance_criterion_param = balance_param; }
     void set_downsample_param(float downsample_param) { downsample_size = downsample_param; }
     void InitializeKDTree(float delete_param = 0.5, float balance_param = 0.7, float box_length = 0.2);
+    void Clear();
     int size();
     int validnum();
     void root_alpha(float &alpha_bal, float &alpha_del);

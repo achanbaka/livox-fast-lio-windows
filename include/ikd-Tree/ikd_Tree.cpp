@@ -38,6 +38,26 @@ void KD_TREE<PointType>::InitializeKDTree(float delete_param, float balance_para
 }
 
 template <typename PointType>
+void KD_TREE<PointType>::Clear()
+{
+    stop_thread();
+    Delete_Storage_Disabled = true;
+    delete_tree_nodes(&Root_Node);
+    delete_tree_nodes(&STATIC_ROOT_NODE);
+    Delete_Storage_Disabled = false;
+    Rebuild_Ptr = nullptr;
+    rebuild_flag = false;
+    Rebuild_Logger.clear();
+    PointVector().swap(PCL_Storage);
+    PointVector().swap(Rebuild_PCL_Storage);
+    PointVector().swap(Points_deleted);
+    PointVector().swap(Downsample_Storage);
+    PointVector().swap(Multithread_Points_deleted);
+    termination_flag = false;
+    start_thread();
+}
+
+template <typename PointType>
 void KD_TREE<PointType>::InitTreeNode(KD_TREE_NODE *root)
 {
     root->point.x = 0.0f;
@@ -1707,4 +1727,3 @@ bool KD_TREE<PointType>::point_cmp_z(PointType a, PointType b) { return a.z < b.
 template class KD_TREE<pcl::PointXYZ>;
 template class KD_TREE<pcl::PointXYZI>;
 template class KD_TREE<pcl::PointXYZINormal>;
-

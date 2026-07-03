@@ -64,6 +64,7 @@ public:
                           const std::string& parent_frame, const std::string& child_frame, double timestamp);
     void broadcastTime(double timestamp);
     void broadcastPlaybackState(const PlaybackState& state);
+    void clearSession();
 
     uint16_t getPort() const { return port_; }
     size_t getClientCount() const;

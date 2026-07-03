@@ -37,6 +37,7 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -821,6 +822,10 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     atomic<uint64_t>    playback_current_time_ns{0};
     atomic<double>      playback_speed{1.0};
     atomic<bool>        playback_paused{false};
+    atomic<bool>        playback_seek_pending{false};
+    atomic<bool>        playback_resume_after_seek{false};
+    mutex               playback_seek_mtx;
+    optional<uint64_t>  playback_seek_time_ns;
 
     if (use_lvx)
     {
@@ -919,9 +924,21 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 lvx_reader->setSpeed(speed);
 
                 if (request.seek_time_ns) {
-                    cerr << "[Foxglove] Seek requests are not yet supported for live SLAM replay; playback paused." << endl;
                     lvx_reader->pause();
-                    playback_paused = true;
+                    if (lvx_reader->seekToTimeNs(*request.seek_time_ns)) {
+                        {
+                            lock_guard<mutex> lock(playback_seek_mtx);
+                            playback_seek_time_ns = *request.seek_time_ns;
+                        }
+                        playback_resume_after_seek =
+                            request.command == FoxglovePublisher::PlaybackCommand::Play;
+                        playback_paused = !playback_resume_after_seek.load();
+                        playback_seek_pending = true;
+                        playback_current_time_ns = *request.seek_time_ns;
+                        sig_buffer.notify_all();
+                    } else {
+                        playback_paused = true;
+                    }
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
                     lvx_reader->pause();
                     playback_paused = true;
@@ -933,9 +950,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 return FoxglovePublisher::PlaybackState{
                     playback_paused ? FoxglovePublisher::PlaybackStatus::Paused
                                     : FoxglovePublisher::PlaybackStatus::Playing,
-                    playback_current_time_ns.load(),
+                    request.seek_time_ns ? *request.seek_time_ns : playback_current_time_ns.load(),
                     static_cast<float>(playback_speed.load()),
-                    false};
+                    request.seek_time_ns.has_value()};
             });
     }
     else if (use_bag && bag_reader && bag_reader->getEndTimeNs() > bag_reader->getStartTimeNs())
@@ -948,9 +965,21 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 bag_reader->setSpeed(speed);
 
                 if (request.seek_time_ns) {
-                    cerr << "[Foxglove] Seek requests are not yet supported for live SLAM replay; playback paused." << endl;
                     bag_reader->pause();
-                    playback_paused = true;
+                    if (bag_reader->seekToTimeNs(*request.seek_time_ns)) {
+                        {
+                            lock_guard<mutex> lock(playback_seek_mtx);
+                            playback_seek_time_ns = *request.seek_time_ns;
+                        }
+                        playback_resume_after_seek =
+                            request.command == FoxglovePublisher::PlaybackCommand::Play;
+                        playback_paused = !playback_resume_after_seek.load();
+                        playback_seek_pending = true;
+                        playback_current_time_ns = *request.seek_time_ns;
+                        sig_buffer.notify_all();
+                    } else {
+                        playback_paused = true;
+                    }
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
                     bag_reader->pause();
                     playback_paused = true;
@@ -962,9 +991,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 return FoxglovePublisher::PlaybackState{
                     playback_paused ? FoxglovePublisher::PlaybackStatus::Paused
                                     : FoxglovePublisher::PlaybackStatus::Playing,
-                    playback_current_time_ns.load(),
+                    request.seek_time_ns ? *request.seek_time_ns : playback_current_time_ns.load(),
                     static_cast<float>(playback_speed.load()),
-                    false};
+                    request.seek_time_ns.has_value()};
             });
     }
 
@@ -1025,6 +1054,71 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // PCD accumulation cloud
     PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 
+    auto reset_slam_state_after_seek = [&]() {
+        {
+            lock_guard<mutex> lock(mtx_buffer);
+            lidar_buffer.clear();
+            time_buffer.clear();
+            imu_buffer.clear();
+            last_timestamp_imu = -1.0;
+        }
+
+        Measures.lidar->clear();
+        Measures.imu.clear();
+        first_lidar_time = 0.0;
+        flg_EKF_inited = false;
+        cub_needrm.clear();
+        path_vec.clear();
+        full_map_accumulator.clear();
+        featsFromMap->clear();
+        feats_undistort->clear();
+        feats_down_body->clear();
+        feats_down_world->clear();
+        normvec->clear();
+        laserCloudOri->clear();
+        corr_normvect->clear();
+        Nearest_Points.clear();
+        point_selected_surf.clear();
+        res_last.clear();
+        effct_feat_num = 0;
+        feats_down_size = 0;
+        res_mean_last = 0.05;
+        total_residual = 0.0;
+        pcl_wait_save->clear();
+        frame_id = 0;
+
+        imu_proc.Reset();
+        imu_proc.lidar_type = config.lidar_type;
+        imu_proc.set_extrinsic(ext_T, ext_R);
+        imu_proc.set_gyr_cov(V3D(config.gyr_cov, config.gyr_cov, config.gyr_cov));
+        imu_proc.set_acc_cov(V3D(config.acc_cov, config.acc_cov, config.acc_cov));
+        imu_proc.set_gyr_bias_cov(V3D(config.b_gyr_cov, config.b_gyr_cov, config.b_gyr_cov));
+        imu_proc.set_acc_bias_cov(V3D(config.b_acc_cov, config.b_acc_cov, config.b_acc_cov));
+
+        ikdtree.Clear();
+        ikdtree.set_downsample_param(static_cast<float>(filter_size_map_min));
+
+        state_ikfom reset_state = kf.get_x();
+        reset_state.pos = vect3::Zero();
+        reset_state.rot = SO3(M3D::Identity());
+        reset_state.vel = vect3::Zero();
+        reset_state.bg  = vect3::Zero();
+        reset_state.ba  = vect3::Zero();
+        reset_state.offset_R_L_I = SO3(ext_R);
+        reset_state.offset_T_L_I = ext_T;
+        kf.change_x(reset_state);
+
+        esekfom::esekf<state_ikfom, 12, input_ikfom>::cov reset_P = kf.get_P();
+        reset_P.setIdentity();
+        reset_P(6,6)   = reset_P(7,7)   = reset_P(8,8)   = 0.00001;
+        reset_P(9,9)   = reset_P(10,10)  = reset_P(11,11)  = 0.00001;
+        reset_P(15,15) = reset_P(16,16) = reset_P(17,17) = 0.0001;
+        reset_P(18,18) = reset_P(19,19) = reset_P(20,20) = 0.001;
+        reset_P(21,21) = reset_P(22,22) = 0.00001;
+        kf.change_P(reset_P);
+        kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, max_iteration, R_limit);
+    };
+
     // Ensure PCD directory exists
     {
         string pcd_dir = root_dir + "PCD";
@@ -1040,7 +1134,57 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ══════════════════════════════════════════════════════════════════
     while (!g_exit_flag.load())
     {
+        if (playback_seek_pending.exchange(false))
+        {
+            uint64_t seek_ns = playback_current_time_ns.load();
+            {
+                lock_guard<mutex> lock(playback_seek_mtx);
+                if (playback_seek_time_ns) {
+                    seek_ns = *playback_seek_time_ns;
+                    playback_seek_time_ns.reset();
+                }
+            }
+
+            reset_slam_state_after_seek();
+            playback_current_time_ns = seek_ns;
+
+            const bool resume_after_seek = playback_resume_after_seek.load();
+            playback_paused = !resume_after_seek;
+            if (lvx_reader) {
+                if (resume_after_seek) lvx_reader->resume();
+                else lvx_reader->pause();
+            }
+            if (bag_reader) {
+                if (resume_after_seek) bag_reader->resume();
+                else bag_reader->pause();
+            }
+
+            if (foxglove.isRunning()) {
+                foxglove.clearSession();
+                foxglove.broadcastTime(static_cast<double>(seek_ns) / 1e9);
+                foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+                    resume_after_seek ? FoxglovePublisher::PlaybackStatus::Playing
+                                      : FoxglovePublisher::PlaybackStatus::Paused,
+                    seek_ns,
+                    static_cast<float>(playback_speed.load()),
+                    true});
+            }
+            continue;
+        }
         // Check EOF for lvx/bag — but only exit after all buffered data is processed
+        if ((use_lvx || use_bag) && playback_paused.load())
+        {
+            if (foxglove.isRunning()) {
+                foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+                    FoxglovePublisher::PlaybackStatus::Paused,
+                    playback_current_time_ns.load(),
+                    static_cast<float>(playback_speed.load()),
+                    false});
+            }
+            this_thread::sleep_for(chrono::milliseconds(20));
+            continue;
+        }
+
         if (use_lvx && lvx_reader && lvx_reader->isEOF())
         {
             lock_guard<mutex> lock(mtx_buffer);

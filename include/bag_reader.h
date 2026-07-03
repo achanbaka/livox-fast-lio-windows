@@ -4,6 +4,7 @@
 #include <string>
 #include <functional>
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -37,6 +38,7 @@ public:
     void setSpeed(double speed);
     void pause();
     void resume();
+    bool seekToTimeNs(uint64_t time_ns);
     void stop();
     bool isEOF() const { return eof_; }
     bool isOpen() const { return bag_reader_.isOpen(); }
@@ -49,7 +51,17 @@ public:
     uint64_t getEndTimeNs() const { return end_time_ns_; }
 
 private:
+    struct TimedMessage {
+        uint32_t conn_id = 0;
+        uint64_t bag_time_ns = 0;
+        double sensor_time = 0.0;
+        std::vector<uint8_t> data;
+    };
+
+    bool loadMessages();
     void playbackThread();
+    bool waitWhilePaused();
+    bool sleepInterruptible(std::chrono::milliseconds duration);
 
     bag::BagFileReader bag_reader_;
     std::string filepath_;
@@ -70,6 +82,11 @@ private:
 
     std::atomic<double> playback_speed_{0.0};
     std::atomic<bool> paused_{false};
+    std::vector<TimedMessage> messages_;
+    bool messages_loaded_ = false;
+    size_t playback_index_ = 0;
+    bool timing_reset_requested_ = true;
+    std::mutex control_mutex_;
     std::mutex pause_mutex_;
     std::condition_variable pause_cv_;
 };
