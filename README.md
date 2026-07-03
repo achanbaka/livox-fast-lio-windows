@@ -1,5 +1,7 @@
 # Livox FAST-LIO Windows
 
+[English README](Readme_EN.md)
+
 **Windows 原生 FAST-LIO2 SLAM 应用** — 支持 Livox Horizon LiDAR 实时建图、Livox SDK1 / LVX v1.1 回放与 ROS1 Bag 回放。
 
 基于 [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) 算法，去除 ROS 依赖，原生运行于 Windows 平台。支持直接解析 Livox SDK1 `.lvx` 录制文件、读取/写入 ROS1 Bag 文件，并可通过 [Foxglove Studio](https://foxglove.dev/) 实时查看建图过程。
