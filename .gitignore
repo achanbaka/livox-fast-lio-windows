@@ -1,0 +1,49 @@
+# Build artifacts
+build/
+build-codex/
+out/
+**/build/
+**/out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Local IDE/editor state
+.vs/
+.vscode/
+
+# Runtime outputs and captured data
+Log/
+PCD/
+*.pcd
+*.bag
+*.lvx
+bag_info.txt
+
+# Dependency installs and package manager working trees
+vcpkg_installed/
+third_party/vcpkg/
+third_party/Livox-SDK/
+third_party/foxglove-sdk/*.zip
+
+# Windows binaries and debug symbols
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.ilk
+*.exp
+
+# Keep the bundled Foxglove SDK redistributable that CMake links against.
+!third_party/foxglove-sdk/v0.25.2/foxglove/lib/foxglove.dll
+!third_party/foxglove-sdk/v0.25.2/foxglove/lib/foxglove.dll.lib
+!third_party/foxglove-sdk/v0.25.2/foxglove/lib/foxglove.lib
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+*.swp
+*~

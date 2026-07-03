@@ -1,0 +1,10 @@
+{
+  "name": "livox-fast-lio-windows",
+  "version-string": "1.0.0",
+  "description": "Windows native FAST-LIO SLAM with Livox LiDAR and Foxglove visualization",
+  "dependencies": [
+    "eigen3",
+    "pcl",
+    "yaml-cpp"
+  ]
+}
