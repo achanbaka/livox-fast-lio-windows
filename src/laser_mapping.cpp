@@ -37,9 +37,9 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
-#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <pcl/io/pcd_io.h>
@@ -108,6 +108,14 @@ static bool   scan_bodyframe_pub_en  = false;
 static bool   publish_full_map       = true;
 static string root_dir;
 static constexpr int MAP_PUBLISH_INTERVAL = 1;
+static constexpr int FULL_MAP_PUBLISH_INTERVAL = 50;
+static constexpr size_t MAX_REPLAY_LIDAR_QUEUE = 3;
+static constexpr int FOXGLOVE_CLOUD_INTERVAL_MS = 100;
+static constexpr int FOXGLOVE_MAP_INTERVAL_MS = 1000;
+static constexpr int FOXGLOVE_PATH_INTERVAL_MS = 200;
+static constexpr int VERBOSE_SLAM_LOG_INTERVAL = 20;
+static atomic<bool> replay_backpressure_enabled{false};
+static atomic<bool> replay_backpressure_stop{false};
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Data buffers – filled from callbacks, consumed by sync_packages
@@ -182,6 +190,86 @@ static void pointBodyToWorld(const V3D &p_body, V3D &p_global)
     p_global = state_point.rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos;
 }
 
+struct VoxelKey {
+    int64_t x = 0;
+    int64_t y = 0;
+    int64_t z = 0;
+
+    bool operator==(const VoxelKey& other) const
+    {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct VoxelKeyHash {
+    size_t operator()(const VoxelKey& key) const
+    {
+        uint64_t h = 1469598103934665603ULL;
+        mix(h, static_cast<uint64_t>(key.x));
+        mix(h, static_cast<uint64_t>(key.y));
+        mix(h, static_cast<uint64_t>(key.z));
+        return static_cast<size_t>(h);
+    }
+
+    static void mix(uint64_t& hash, uint64_t value)
+    {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+};
+
+static bool isUsablePoint(const PointType& point)
+{
+    constexpr float kMaxAbsCoordinate = 1000000.0f;
+    return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z) &&
+           std::abs(point.x) <= kMaxAbsCoordinate &&
+           std::abs(point.y) <= kMaxAbsCoordinate &&
+           std::abs(point.z) <= kMaxAbsCoordinate;
+}
+
+static void voxelDownsampleSafe(const PointCloudXYZI::Ptr& input,
+                                PointCloudXYZI::Ptr& output,
+                                double leaf_size)
+{
+    output->clear();
+    if (!input || input->empty()) {
+        return;
+    }
+
+    if (leaf_size <= 0.0) {
+        output->points.reserve(input->points.size());
+        for (const auto& point : input->points) {
+            if (isUsablePoint(point)) {
+                output->points.push_back(point);
+            }
+        }
+    } else {
+        const double inv_leaf = 1.0 / leaf_size;
+        std::unordered_map<VoxelKey, PointType, VoxelKeyHash> voxels;
+        voxels.reserve(input->points.size());
+        for (const auto& point : input->points) {
+            if (!isUsablePoint(point)) {
+                continue;
+            }
+            const VoxelKey key{
+                static_cast<int64_t>(std::floor(static_cast<double>(point.x) * inv_leaf)),
+                static_cast<int64_t>(std::floor(static_cast<double>(point.y) * inv_leaf)),
+                static_cast<int64_t>(std::floor(static_cast<double>(point.z) * inv_leaf)),
+            };
+            voxels.try_emplace(key, point);
+        }
+
+        output->points.reserve(voxels.size());
+        for (const auto& entry : voxels) {
+            output->points.push_back(entry.second);
+        }
+    }
+
+    output->width = static_cast<uint32_t>(output->points.size());
+    output->height = 1;
+    output->is_dense = true;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Data callbacks – push into global buffers
 // ═══════════════════════════════════════════════════════════════════════
@@ -193,7 +281,18 @@ static void pointBodyToWorld(const V3D &p_body, V3D &p_global)
 static void pushLidarFrame(PointCloudXYZI::Ptr cloud, double timestamp)
 {
     if (!cloud || cloud->empty()) return;
-    lock_guard<mutex> lock(mtx_buffer);
+    unique_lock<mutex> lock(mtx_buffer);
+    if (replay_backpressure_enabled.load())
+    {
+        sig_buffer.wait(lock, [] {
+            return replay_backpressure_stop.load() ||
+                   g_exit_flag.load() ||
+                   lidar_buffer.size() < MAX_REPLAY_LIDAR_QUEUE;
+        });
+        if (replay_backpressure_stop.load() || g_exit_flag.load()) {
+            return;
+        }
+    }
     lidar_buffer.push_back(cloud);
     time_buffer.push_back(timestamp);
     sig_buffer.notify_one();
@@ -279,6 +378,7 @@ bool sync_packages(MeasureGroup &meas)
         {
             lidar_buffer.pop_front();
             time_buffer.pop_front();
+            sig_buffer.notify_all();
             return false;
         }
 
@@ -299,6 +399,7 @@ bool sync_packages(MeasureGroup &meas)
 
         lidar_buffer.pop_front();
         time_buffer.pop_front();
+        sig_buffer.notify_all();
 
         while (!imu_buffer.empty())
         {
@@ -517,7 +618,12 @@ void h_share_model(state_ikfom &state, esekfom::dyn_share_datastruct<double> &ek
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
-        cout << "[SLAM] No effective points for IEKF update" << endl;
+        static int no_effective_log_count = 0;
+        no_effective_log_count++;
+        if (runtime_pos_log &&
+            no_effective_log_count % VERBOSE_SLAM_LOG_INTERVAL == 0) {
+            cout << "[SLAM] No effective points for IEKF update" << '\n';
+        }
         return;
     }
 
@@ -746,6 +852,8 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     scan_bodyframe_pub_en  = config.scan_bodyframe_pub_en;
     publish_full_map       = config.publish_full_map;
     root_dir               = config.root_dir.empty() ? string(ROOT_DIR) : config.root_dir;
+    replay_backpressure_enabled = use_lvx || use_bag;
+    replay_backpressure_stop = false;
 
     // ── Initialise ikd-Tree ──────────────────────────────────────────
     ikdtree.set_downsample_param(static_cast<float>(filter_size_map_min));
@@ -822,10 +930,6 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     atomic<uint64_t>    playback_current_time_ns{0};
     atomic<double>      playback_speed{1.0};
     atomic<bool>        playback_paused{false};
-    atomic<bool>        playback_seek_pending{false};
-    atomic<bool>        playback_resume_after_seek{false};
-    mutex               playback_seek_mtx;
-    optional<uint64_t>  playback_seek_time_ns;
 
     if (use_lvx)
     {
@@ -924,21 +1028,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 lvx_reader->setSpeed(speed);
 
                 if (request.seek_time_ns) {
-                    lvx_reader->pause();
-                    if (lvx_reader->seekToTimeNs(*request.seek_time_ns)) {
-                        {
-                            lock_guard<mutex> lock(playback_seek_mtx);
-                            playback_seek_time_ns = *request.seek_time_ns;
-                        }
-                        playback_resume_after_seek =
-                            request.command == FoxglovePublisher::PlaybackCommand::Play;
-                        playback_paused = !playback_resume_after_seek.load();
-                        playback_seek_pending = true;
-                        playback_current_time_ns = *request.seek_time_ns;
-                        sig_buffer.notify_all();
-                    } else {
-                        playback_paused = true;
-                    }
+                    // Seek is temporarily disabled because Foxglove clears the rendered map on seek.
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
                     lvx_reader->pause();
                     playback_paused = true;
@@ -950,9 +1040,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 return FoxglovePublisher::PlaybackState{
                     playback_paused ? FoxglovePublisher::PlaybackStatus::Paused
                                     : FoxglovePublisher::PlaybackStatus::Playing,
-                    request.seek_time_ns ? *request.seek_time_ns : playback_current_time_ns.load(),
+                    playback_current_time_ns.load(),
                     static_cast<float>(playback_speed.load()),
-                    request.seek_time_ns.has_value()};
+                    false};
             });
     }
     else if (use_bag && bag_reader && bag_reader->getEndTimeNs() > bag_reader->getStartTimeNs())
@@ -965,21 +1055,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 bag_reader->setSpeed(speed);
 
                 if (request.seek_time_ns) {
-                    bag_reader->pause();
-                    if (bag_reader->seekToTimeNs(*request.seek_time_ns)) {
-                        {
-                            lock_guard<mutex> lock(playback_seek_mtx);
-                            playback_seek_time_ns = *request.seek_time_ns;
-                        }
-                        playback_resume_after_seek =
-                            request.command == FoxglovePublisher::PlaybackCommand::Play;
-                        playback_paused = !playback_resume_after_seek.load();
-                        playback_seek_pending = true;
-                        playback_current_time_ns = *request.seek_time_ns;
-                        sig_buffer.notify_all();
-                    } else {
-                        playback_paused = true;
-                    }
+                    // Seek is temporarily disabled because Foxglove clears the rendered map on seek.
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
                     bag_reader->pause();
                     playback_paused = true;
@@ -991,9 +1067,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 return FoxglovePublisher::PlaybackState{
                     playback_paused ? FoxglovePublisher::PlaybackStatus::Paused
                                     : FoxglovePublisher::PlaybackStatus::Playing,
-                    request.seek_time_ns ? *request.seek_time_ns : playback_current_time_ns.load(),
+                    playback_current_time_ns.load(),
                     static_cast<float>(playback_speed.load()),
-                    request.seek_time_ns.has_value()};
+                    false};
             });
     }
 
@@ -1050,74 +1126,16 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ── Timing & bookkeeping ─────────────────────────────────────────
     int  frame_id = 0;
     double T1, T2, s_plot, s_plot2, s_plot3, s_plot4, s_plot5, s_plot6;
+    const auto foxglove_publish_start = chrono::steady_clock::now();
+    auto last_foxglove_cloud_pub =
+        foxglove_publish_start - chrono::milliseconds(FOXGLOVE_CLOUD_INTERVAL_MS);
+    auto last_foxglove_map_pub =
+        foxglove_publish_start - chrono::milliseconds(FOXGLOVE_MAP_INTERVAL_MS);
+    auto last_foxglove_path_pub =
+        foxglove_publish_start - chrono::milliseconds(FOXGLOVE_PATH_INTERVAL_MS);
 
     // PCD accumulation cloud
     PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-
-    auto reset_slam_state_after_seek = [&]() {
-        {
-            lock_guard<mutex> lock(mtx_buffer);
-            lidar_buffer.clear();
-            time_buffer.clear();
-            imu_buffer.clear();
-            last_timestamp_imu = -1.0;
-        }
-
-        Measures.lidar->clear();
-        Measures.imu.clear();
-        first_lidar_time = 0.0;
-        flg_EKF_inited = false;
-        cub_needrm.clear();
-        path_vec.clear();
-        full_map_accumulator.clear();
-        featsFromMap->clear();
-        feats_undistort->clear();
-        feats_down_body->clear();
-        feats_down_world->clear();
-        normvec->clear();
-        laserCloudOri->clear();
-        corr_normvect->clear();
-        Nearest_Points.clear();
-        point_selected_surf.clear();
-        res_last.clear();
-        effct_feat_num = 0;
-        feats_down_size = 0;
-        res_mean_last = 0.05;
-        total_residual = 0.0;
-        pcl_wait_save->clear();
-        frame_id = 0;
-
-        imu_proc.Reset();
-        imu_proc.lidar_type = config.lidar_type;
-        imu_proc.set_extrinsic(ext_T, ext_R);
-        imu_proc.set_gyr_cov(V3D(config.gyr_cov, config.gyr_cov, config.gyr_cov));
-        imu_proc.set_acc_cov(V3D(config.acc_cov, config.acc_cov, config.acc_cov));
-        imu_proc.set_gyr_bias_cov(V3D(config.b_gyr_cov, config.b_gyr_cov, config.b_gyr_cov));
-        imu_proc.set_acc_bias_cov(V3D(config.b_acc_cov, config.b_acc_cov, config.b_acc_cov));
-
-        ikdtree.Clear();
-        ikdtree.set_downsample_param(static_cast<float>(filter_size_map_min));
-
-        state_ikfom reset_state = kf.get_x();
-        reset_state.pos = vect3::Zero();
-        reset_state.rot = SO3(M3D::Identity());
-        reset_state.vel = vect3::Zero();
-        reset_state.bg  = vect3::Zero();
-        reset_state.ba  = vect3::Zero();
-        reset_state.offset_R_L_I = SO3(ext_R);
-        reset_state.offset_T_L_I = ext_T;
-        kf.change_x(reset_state);
-
-        esekfom::esekf<state_ikfom, 12, input_ikfom>::cov reset_P = kf.get_P();
-        reset_P.setIdentity();
-        reset_P(6,6)   = reset_P(7,7)   = reset_P(8,8)   = 0.00001;
-        reset_P(9,9)   = reset_P(10,10)  = reset_P(11,11)  = 0.00001;
-        reset_P(15,15) = reset_P(16,16) = reset_P(17,17) = 0.0001;
-        reset_P(18,18) = reset_P(19,19) = reset_P(20,20) = 0.001;
-        reset_P(21,21) = reset_P(22,22) = 0.00001;
-        kf.change_P(reset_P);
-        kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, max_iteration, R_limit);
-    };
 
     // Ensure PCD directory exists
     {
@@ -1127,6 +1145,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
     cout << "=================================================" << endl;
     cout << "  FAST-LIO2 SLAM loop started.  Press Ctrl-C to stop." << endl;
+    cout << "  Playback control build: seek requests disabled." << endl;
     cout << "=================================================" << endl;
 
     // ══════════════════════════════════════════════════════════════════
@@ -1134,43 +1153,6 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ══════════════════════════════════════════════════════════════════
     while (!g_exit_flag.load())
     {
-        if (playback_seek_pending.exchange(false))
-        {
-            uint64_t seek_ns = playback_current_time_ns.load();
-            {
-                lock_guard<mutex> lock(playback_seek_mtx);
-                if (playback_seek_time_ns) {
-                    seek_ns = *playback_seek_time_ns;
-                    playback_seek_time_ns.reset();
-                }
-            }
-
-            reset_slam_state_after_seek();
-            playback_current_time_ns = seek_ns;
-
-            const bool resume_after_seek = playback_resume_after_seek.load();
-            playback_paused = !resume_after_seek;
-            if (lvx_reader) {
-                if (resume_after_seek) lvx_reader->resume();
-                else lvx_reader->pause();
-            }
-            if (bag_reader) {
-                if (resume_after_seek) bag_reader->resume();
-                else bag_reader->pause();
-            }
-
-            if (foxglove.isRunning()) {
-                foxglove.clearSession();
-                foxglove.broadcastTime(static_cast<double>(seek_ns) / 1e9);
-                foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
-                    resume_after_seek ? FoxglovePublisher::PlaybackStatus::Playing
-                                      : FoxglovePublisher::PlaybackStatus::Paused,
-                    seek_ns,
-                    static_cast<float>(playback_speed.load()),
-                    true});
-            }
-            continue;
-        }
         // Check EOF for lvx/bag — but only exit after all buffered data is processed
         if ((use_lvx || use_bag) && playback_paused.load())
         {
@@ -1226,11 +1208,16 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         // Diagnostic: log SLAM frame processing
         static int slam_frame_count = 0;
         slam_frame_count++;
-        cout << "[SLAM] Frame " << slam_frame_count
-             << " pts=" << Measures.lidar->points.size()
-             << " imu=" << Measures.imu.size()
-             << " t_beg=" << Measures.lidar_beg_time
-             << " t_end=" << Measures.lidar_end_time << endl;
+        const bool verbose_slam_log =
+            runtime_pos_log &&
+            (slam_frame_count % VERBOSE_SLAM_LOG_INTERVAL == 0);
+        if (verbose_slam_log) {
+            cout << "[SLAM] Frame " << slam_frame_count
+                 << " pts=" << Measures.lidar->points.size()
+                 << " imu=" << Measures.imu.size()
+                 << " t_beg=" << Measures.lidar_beg_time
+                 << " t_end=" << Measures.lidar_end_time << '\n';
+        }
 
         // ── 2. IMU propagation & undistortion ──────────────────────
         T1 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
@@ -1241,23 +1228,23 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         // featsFromMap now holds the undistorted point cloud
         if (feats_undistort->points.empty())
         {
-            cout << "[LaserMapping] No undistorted points, skipping frame."
-                 << " (slam_frame=" << slam_frame_count << ")" << endl;
+            static int no_undistorted_log_count = 0;
+            no_undistorted_log_count++;
+            if (runtime_pos_log &&
+                no_undistorted_log_count % VERBOSE_SLAM_LOG_INTERVAL == 0) {
+                cout << "[LaserMapping] No undistorted points, skipping frame."
+                     << " (slam_frame=" << slam_frame_count << ")" << '\n';
+            }
             continue;
         }
-        cout << "[SLAM] Undistorted pts=" << feats_undistort->points.size() << endl;
+        if (verbose_slam_log) {
+            cout << "[SLAM] Undistorted pts=" << feats_undistort->points.size() << '\n';
+        }
 
         // ── 3. Downsample ───────────────────────────────────────────
         T1 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
 
-        // Voxel-grid downsample
-        pcl::VoxelGrid<PointType> downSizeFilter;
-        downSizeFilter.setLeafSize(
-            static_cast<float>(filter_size_surf_min),
-            static_cast<float>(filter_size_surf_min),
-            static_cast<float>(filter_size_surf_min));
-        downSizeFilter.setInputCloud(feats_undistort);
-        downSizeFilter.filter(*feats_down_body);
+        voxelDownsampleSafe(feats_undistort, feats_down_body, filter_size_surf_min);
         T2 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
         s_plot3 = (T2 - T1) * 1000.0;
 
@@ -1269,11 +1256,18 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         }
 
         feats_down_size = static_cast<int>(feats_down_body->points.size());
-        cout << "[SLAM] DS pts=" << feats_down_size << flush << endl;
+        if (verbose_slam_log) {
+            cout << "[SLAM] DS pts=" << feats_down_size << '\n';
+        }
 
         if (feats_down_size < 5)
         {
-            cout << "[LaserMapping] Too few downsampled points, skipping frame." << endl;
+            static int too_few_downsampled_log_count = 0;
+            too_few_downsampled_log_count++;
+            if (runtime_pos_log &&
+                too_few_downsampled_log_count % VERBOSE_SLAM_LOG_INTERVAL == 0) {
+                cout << "[LaserMapping] Too few downsampled points, skipping frame." << '\n';
+            }
             continue;
         }
 
@@ -1281,7 +1275,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         // Skip IEKF on first frame when ikd-Tree is empty (no map yet)
         if (ikdtree.size() == 0)
         {
-            cout << "[SLAM] First frame, skip IEKF (empty map)" << flush << endl;
+            if (verbose_slam_log) {
+                cout << "[SLAM] First frame, skip IEKF (empty map)" << '\n';
+            }
         }
         else
         {
@@ -1295,7 +1291,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             iekf_update_wrapper(solve_time);
             T2 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
             s_plot4 = (T2 - T1) * 1000.0;
-            cout << "[SLAM] IEKF done effective=" << effct_feat_num << flush << endl;
+            if (verbose_slam_log) {
+                cout << "[SLAM] IEKF done effective=" << effct_feat_num << '\n';
+            }
         }
 
         // Update cached state
@@ -1320,6 +1318,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         playback_current_time_ns = pub_time_ns;
         const bool write_bag_output = (bag_writer && bag_writer->isOpen());
         const bool publish_foxglove = foxglove.isRunning();
+        const auto publish_wall_now = chrono::steady_clock::now();
 
         // Publish odometry
         V3D pos_v3d(state_point.pos[0], state_point.pos[1], state_point.pos[2]);
@@ -1352,8 +1351,14 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 bag_writer->writePointCloud(pub_time_ns, cloud_world, kFastLioMapFrame,
                                             kFastLioRegisteredCloudTopic);
             }
-            if (publish_foxglove) {
+            const bool publish_foxglove_cloud =
+                publish_foxglove &&
+                chrono::duration_cast<chrono::milliseconds>(
+                    publish_wall_now - last_foxglove_cloud_pub).count() >=
+                    FOXGLOVE_CLOUD_INTERVAL_MS;
+            if (publish_foxglove_cloud) {
                 foxglove.publishPointCloud(cloud_world, pub_time);
+                last_foxglove_cloud_pub = publish_wall_now;
             }
         }
 
@@ -1361,8 +1366,15 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             full_map_accumulator.addFrame(cloud_world);
         }
 
-        if ((publish_foxglove || write_bag_output) &&
-            frame_id % MAP_PUBLISH_INTERVAL == 0)
+        const int map_publish_interval =
+            publish_full_map ? FULL_MAP_PUBLISH_INTERVAL : MAP_PUBLISH_INTERVAL;
+        const bool publish_foxglove_map =
+            publish_foxglove &&
+            chrono::duration_cast<chrono::milliseconds>(
+                publish_wall_now - last_foxglove_map_pub).count() >=
+                FOXGLOVE_MAP_INTERVAL_MS;
+        if ((publish_foxglove_map || write_bag_output) &&
+            frame_id % map_publish_interval == 0)
         {
             PointCloudXYZI map_cloud;
             if (publish_full_map) {
@@ -1383,8 +1395,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                     bag_writer->writePointCloud(pub_time_ns, map_cloud, kFastLioMapFrame,
                                                 kFastLioMapTopic);
                 }
-                if (publish_foxglove) {
+                if (publish_foxglove_map) {
                     foxglove.publishMap(map_cloud, pub_time);
+                    last_foxglove_map_pub = publish_wall_now;
                 }
             }
         }
@@ -1396,8 +1409,14 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             if (write_bag_output) {
                 bag_writer->writePath(pub_time_ns, path_vec, kFastLioMapFrame);
             }
-            if (publish_foxglove) {
+            const bool publish_foxglove_path =
+                publish_foxglove &&
+                chrono::duration_cast<chrono::milliseconds>(
+                    publish_wall_now - last_foxglove_path_pub).count() >=
+                    FOXGLOVE_PATH_INTERVAL_MS;
+            if (publish_foxglove_path) {
                 foxglove.publishPath(path_vec, pub_time);
+                last_foxglove_path_pub = publish_wall_now;
             }
         }
 
@@ -1468,6 +1487,24 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ══════════════════════════════════════════════════════════════════
     cout << "\n[LaserMapping] Shutting down..." << endl;
 
+    if (publish_full_map && (foxglove.isRunning() || (bag_writer && bag_writer->isOpen()))) {
+        PointCloudXYZI final_map = full_map_accumulator.snapshot();
+        if (!final_map.empty()) {
+            final_map.width = static_cast<uint32_t>(final_map.points.size());
+            final_map.height = 1;
+            final_map.is_dense = true;
+            const uint64_t final_time_ns = playback_current_time_ns.load();
+            const double final_time = static_cast<double>(final_time_ns) / 1e9;
+            if (bag_writer && bag_writer->isOpen()) {
+                bag_writer->writePointCloud(final_time_ns, final_map, kFastLioMapFrame,
+                                            kFastLioMapTopic);
+            }
+            if (foxglove.isRunning()) {
+                foxglove.publishMap(final_map, final_time);
+            }
+        }
+    }
+
     if ((use_lvx || use_bag) && foxglove.isRunning()) {
         foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
             FoxglovePublisher::PlaybackStatus::Ended,
@@ -1477,6 +1514,8 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     }
 
     // Stop data sources
+    replay_backpressure_stop = true;
+    sig_buffer.notify_all();
     if (lvx_reader) lvx_reader->stop();
     if (livox_adapter) livox_adapter->stop();
     if (bag_reader) bag_reader->stop();

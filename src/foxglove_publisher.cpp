@@ -163,6 +163,7 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
     options.host = host;
     options.port = port;
     options.capabilities = fg::WebSocketServerCapabilities::Time;
+    options.message_backlog_size = 8;
     if (playback_time_range_ && playback_control_callback_) {
         options.playback_time_range = playback_time_range_;
         options.capabilities =
