@@ -527,7 +527,7 @@ This project is based on the original FAST-LIO2 code and follows the [GPLv2](htt
 
 - [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) — HKU MARS Lab
 - [ikd-Tree](https://github.com/hku-mars/ikd-Tree) — incremental k-d tree
-- [IKFoM](https://github.com/RozDavid/IkFoM) — iterated Kalman filter on manifolds
-- [Livox SDK](https://github.com/Livox-SDK/Livox-SDK) — Livox robotics
-- [Foxglove](https://foxglove.dev/) — robotics data visualization
+- [IKFoM](https://github.com/hku-mars/IKFoM) — iterated Kalman filter on manifolds
+- [Livox SDK](https://github.com/Livox-SDK/Livox-SDK) — Livoxtech
+- [Foxglove](https://foxglove.dev/) — robotics data visualization platform
 - [ROS Bag Format](http://wiki.ros.org/Bags/Format/2.0) — ROS1 bag file format specification
