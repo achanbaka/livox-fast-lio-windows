@@ -3,6 +3,7 @@
 [中文 README](README.md)
 
 **Native Windows FAST-LIO2 SLAM application** — supports real-time mapping with Livox Horizon LiDAR, Livox SDK1 / LVX v1.1 playback, and ROS1 Bag playback.
+![Demo](Screen_Record.gif)
 
 Based on the [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) algorithm, this project removes the ROS dependency and runs natively on Windows. It can parse Livox SDK1 `.lvx` recordings directly, read and write ROS1 Bag files, and stream mapping results to [Foxglove Studio](https://foxglove.dev/) in real time.
 
