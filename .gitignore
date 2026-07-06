@@ -27,7 +27,6 @@ bag_info.txt
 # Dependency installs and package manager working trees
 vcpkg_installed/
 third_party/vcpkg/
-third_party/Livox-SDK/
 third_party/foxglove-sdk/*.zip
 
 # Windows binaries and debug symbols

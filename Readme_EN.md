@@ -71,7 +71,7 @@ This project uses [vcpkg](https://vcpkg.io/) to manage core C++ dependencies. Se
 | **Foxglove C++ SDK** | Official Foxglove WebSocket and protobuf schema publishing, located at `third_party/foxglove-sdk/` |
 | **bzip2** | bzip2 decompression support for bag files |
 | **lz4** | lz4 decompression support for bag files |
-| **Livox SDK source** | Real-time Horizon connection and LVX SDK1 data structure reference; included under `third_party/Livox-SDK`, and CMake builds and links `livox_sdk_static` automatically |
+| **Livox SDK source** | Real-time Horizon connection and LVX SDK1 data structure reference; referenced as a submodule at `third_party/Livox-SDK`, and CMake builds and links `livox_sdk_static` automatically |
 
 Installation steps:
 
@@ -414,7 +414,7 @@ PCD files can be viewed with:
 
 ## Connecting a Real Livox LiDAR
 
-The repository includes `third_party/Livox-SDK`. CMake builds the official SDK1 `sdk_core` target and links it into `livox_fast_lio.exe` automatically. The live connection flow is:
+The repository references `third_party/Livox-SDK` as a git submodule. CMake builds the official SDK1 `sdk_core` target and links it into `livox_fast_lio.exe` automatically. The live connection flow is:
 
 1. Initialize Livox SDK
 2. Listen for Livox device broadcasts on the LAN
@@ -422,11 +422,10 @@ The repository includes `third_party/Livox-SDK`. CMake builds the official SDK1 
 4. Start sampling with `LidarStartSampling(...)` after the device reaches `Normal`
 5. Feed live point cloud and IMU data into FAST-LIO2
 
-If your local checkout is missing `third_party/Livox-SDK`, fetch the official SDK:
+If your local checkout is missing `third_party/Livox-SDK`, initialize the official SDK submodule:
 
 ```powershell
-cd third_party
-git clone https://github.com/Livox-SDK/Livox-SDK.git
+git submodule update --init --recursive third_party/Livox-SDK
 ```
 
 Then reconfigure and rebuild the main project:

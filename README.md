@@ -71,7 +71,7 @@
 | **Foxglove C++ SDK** | 官方 Foxglove WebSocket 与 protobuf schema 发布（位于 `third_party/foxglove-sdk/`） |
 | **bzip2** | Bag 文件 bzip2 解压支持 |
 | **lz4** | Bag 文件 lz4 解压支持 |
-| **Livox SDK 源码** | 实时 Horizon 连接与 LVX SDK1 数据结构对照；已放在 `third_party/Livox-SDK`，CMake 会自动构建并链接 `livox_sdk_static` |
+| **Livox SDK 源码** | 实时 Horizon 连接与 LVX SDK1 数据结构对照；通过 submodule 引用到 `third_party/Livox-SDK`，CMake 会自动构建并链接 `livox_sdk_static` |
 
 安装步骤：
 
@@ -409,7 +409,7 @@ PCD 文件可使用以下工具查看：
 
 ## 连接真实 Livox LiDAR
 
-仓库已包含 `third_party/Livox-SDK`，CMake 会自动构建官方 SDK1 的 `sdk_core` 并链接到 `livox_fast_lio.exe`。实时模式的连接流程为：
+仓库通过 git submodule 引用 `third_party/Livox-SDK`，CMake 会自动构建官方 SDK1 的 `sdk_core` 并链接到 `livox_fast_lio.exe`。实时模式的连接流程为：
 
 1. 初始化 Livox SDK
 2. 监听内网中的 Livox 设备广播
@@ -417,11 +417,10 @@ PCD 文件可使用以下工具查看：
 4. 设备进入 `Normal` 状态后调用 `LidarStartSampling(...)`
 5. 将实时点云和 IMU 数据送入 FAST-LIO2
 
-如果你的本地仓库缺少 `third_party/Livox-SDK`，可以重新获取官方 SDK：
+如果你的本地仓库缺少 `third_party/Livox-SDK`，可以初始化官方 SDK submodule：
 
 ```powershell
-cd third_party
-git clone https://github.com/Livox-SDK/Livox-SDK.git
+git submodule update --init --recursive third_party/Livox-SDK
 ```
 
 然后重新配置和编译主工程：
