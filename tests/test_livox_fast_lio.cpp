@@ -102,7 +102,7 @@ static int testLivoxSdkStubMatchesOfficialLayout() {
     if (expect(sizeof(LivoxDualExtendSpherPoint) == 16)) return 1;
     if (expect(sizeof(LivoxTripleExtendRawPoint) == 42)) return 1;
     if (expect(sizeof(LivoxTripleExtendSpherPoint) == 22)) return 1;
-    if (expect(sizeof(LivoxImuPacket) == 24)) return 1;
+    if (expect(sizeof(LivoxImuPoint) == 24)) return 1;
     return 0;
 }
 

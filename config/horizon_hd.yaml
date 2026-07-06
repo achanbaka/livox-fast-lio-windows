@@ -1,0 +1,47 @@
+common:
+    lid_topic:  "/livox/lidar"
+    imu_topic:  "/livox/imu"
+    livox_broadcast_code: ""    # optional: set Horizon broadcast code to lock onto one device
+    realtime_frame_sec: 0.10    # seconds accumulated into one FAST-LIO frame in live mode
+    realtime_frame_points: 30000
+    time_sync_en: false
+    time_offset_lidar_to_imu: 0.0
+
+preprocess:
+    lidar_type: 1
+    scan_line:  6
+    blind: 4
+    feature_enabled: false
+    point_filter_num: 1         # keep more Livox points for high-density mapping
+
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    max_iteration: 4
+    max_feature_points: 4000
+    filter_size_surf: 0.2       # current-frame voxel leaf size, meters
+    filter_size_map: 0.2        # ikd-Tree/map voxel leaf size, meters
+    cube_side_length: 1000
+    fov_degree:    100
+    det_range:     260.0
+    extrinsic_est_en:  true
+    extrinsic_T: [ 0.05512, 0.02226, -0.0297 ]
+    extrinsic_R: [ 1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]
+
+publish:
+    path_en:  true
+    scan_publish_en:  true
+    dense_publish_en: true
+    scan_bodyframe_pub_en: true
+    publish_full_map: true
+
+pcd_save:
+    pcd_save_en: true
+    interval: -1
+
+runtime:
+    runtime_pos_log_enable: false

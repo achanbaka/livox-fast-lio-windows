@@ -1,0 +1,101 @@
+{
+  "cameraState": {
+    "perspective": true,
+    "distance": 363.0023819048941,
+    "phi": 68.66805097819987,
+    "thetaOffset": 81.23063454497044,
+    "targetOffset": [
+      88.13726448424912,
+      10.258099498231187,
+      -0.28431784042369906
+    ],
+    "target": [
+      0,
+      0,
+      0
+    ],
+    "targetOrientation": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "fovy": 45,
+    "near": 0.5,
+    "far": 5000
+  },
+  "followMode": "follow-pose",
+  "followTf": "map",
+  "fixedFrame": "map",
+  "scene": {
+    "enableStats": true,
+    "syncCamera": false
+  },
+  "transforms": {
+    "frame:map": {
+      "visible": true
+    },
+    "frame:base_link": {
+      "visible": true
+    }
+  },
+  "topics": {
+    "/cloud_registered": {
+      "visible": true,
+      "colorField": "intensity",
+      "colorMode": "colormap",
+      "colorMap": "turbo",
+      "pointSize": 1.5,
+      "decayTime": 0.5
+    },
+    "/path": {
+      "visible": true,
+      "type": "line",
+      "gradient": [
+        "#ffb8662b",
+        "#ff9666ff"
+      ],
+      "lineWidth": 0.2
+    },
+    "/map": {
+      "visible": true,
+      "colorField": "intensity",
+      "colorMode": "colormap",
+      "colorMap": "turbo",
+      "pointSize": 1.5
+    }
+  },
+  "layers": {
+    "grid": {
+      "visible": true,
+      "drawBehind": false,
+      "instanceId": "56c7ef8a-53c2-45ea-95a8-89c4c06a5689",
+      "layerId": "foxglove.Grid",
+      "size": 10,
+      "divisions": 10,
+      "lineWidth": 1,
+      "color": "#248eff",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "publish": {
+    "type": "point",
+    "poseTopic": "/move_base_simple/goal",
+    "pointTopic": "/clicked_point",
+    "poseEstimateTopic": "/initialpose",
+    "poseEstimateXDeviation": 0.5,
+    "poseEstimateYDeviation": 0.5,
+    "poseEstimateThetaDeviation": 0.26179939
+  },
+  "synchronize": false,
+  "imageMode": {}
+}

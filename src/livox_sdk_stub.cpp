@@ -1,62 +1,91 @@
-/**
- * Livox SDK stub implementations for Windows FAST-LIO port.
- * 
- * These stubs allow the project to link without the actual Livox SDK library.
- * When a real Livox Horizon device is connected, replace with the full SDK.
- * 
- * All functions return failure/empty values -- the livox_adapter will detect
- * this and report "SDK init failed" gracefully.
+/*
+ * Stub Livox SDK implementation used only when third_party/Livox-SDK is absent.
+ * Real hardware builds link the official SDK and do not compile this file.
  */
 #include "livox_sdk.h"
 #include <cstdio>
 
-// Stored callbacks (unused in stub mode)
-static DeviceConnectCallback      g_broadcast_cb      = nullptr;
-static DeviceStateUpdateCallback  g_state_update_cb   = nullptr;
+static DeviceBroadcastCallback g_broadcast_cb = nullptr;
+static DeviceStateUpdateCallback g_state_cb = nullptr;
+
+void GetLivoxSdkVersion(LivoxSdkVersion *version)
+{
+    if (!version) return;
+    version->major = 0;
+    version->minor = 0;
+    version->patch = 0;
+}
+
+void DisableConsoleLogger() {}
 
 bool Init()
 {
-    std::printf("[LivoxSDK-Stub] Init() called -- no real SDK, returning false\n");
+    std::printf("[LivoxSDK-Stub] Init() called; no real SDK is linked.\n");
     return false;
 }
 
-void UninitLivoxSdk()
+bool Start()
 {
-    g_broadcast_cb    = nullptr;
-    g_state_update_cb = nullptr;
+    return false;
 }
 
-void SetBroadcastCallback(DeviceConnectCallback cb)
+void Uninit()
+{
+    g_broadcast_cb = nullptr;
+    g_state_cb = nullptr;
+}
+
+void SaveLoggerFile() {}
+
+void SetBroadcastCallback(DeviceBroadcastCallback cb)
 {
     g_broadcast_cb = cb;
 }
 
 void SetDeviceStateUpdateCallback(DeviceStateUpdateCallback cb)
 {
-    g_state_update_cb = cb;
+    g_state_cb = cb;
 }
 
-bool StartSample()
-{
-    return false;
-}
-
-void StopSample()
-{
-}
-
-uint8_t AddDeviceToConnect(const char* broadcast_code, uint8_t* handle)
+livox_status AddLidarToConnect(const char *, uint8_t *handle)
 {
     if (handle) *handle = 0;
-    return 0;  // success code, but nothing actually happens
+    return kStatusFailure;
 }
 
-bool SetDataCallback(uint8_t handle, DataCallback cb, void* client_data)
+livox_status QueryDeviceInformation(uint8_t, DeviceInformationCallback, void *)
 {
-    return false;
+    return kStatusFailure;
 }
 
-bool GetLidarFirmwareVersion(uint8_t handle, uint8_t* version, uint8_t size)
+void SetDataCallback(uint8_t, DataCallback, void *) {}
+
+livox_status SetErrorMessageCallback(uint8_t, ErrorMessageCallback)
 {
-    return false;
+    return kStatusFailure;
+}
+
+livox_status SetCartesianCoordinate(uint8_t, CommonCommandCallback, void *)
+{
+    return kStatusFailure;
+}
+
+livox_status LidarStartSampling(uint8_t, CommonCommandCallback, void *)
+{
+    return kStatusFailure;
+}
+
+livox_status LidarStopSampling(uint8_t, CommonCommandCallback, void *)
+{
+    return kStatusFailure;
+}
+
+livox_status LidarSetImuPushFrequency(uint8_t, ImuFreq, CommonCommandCallback, void *)
+{
+    return kStatusFailure;
+}
+
+livox_status LidarSetPointCloudReturnMode(uint8_t, PointCloudReturnMode, CommonCommandCallback, void *)
+{
+    return kStatusFailure;
 }

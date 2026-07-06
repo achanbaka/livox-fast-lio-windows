@@ -13,6 +13,9 @@ struct FastLioConfig
     std::string imu_topic;
     bool time_sync_en;
     double time_offset_lidar_to_imu;
+    std::string livox_broadcast_code;
+    double realtime_frame_sec;
+    int realtime_frame_points;
 
     // Preprocess
     int lidar_type;

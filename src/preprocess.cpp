@@ -2,6 +2,7 @@
 #include "livox_sdk.h"  // Livox SDK data types
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 
 typedef unsigned int uint;
@@ -59,7 +60,7 @@ void Preprocess::process(const LivoxEthPacket* data, uint32_t num, double timest
   
   uint32_t valid_count = 0;
   
-  for (uint32_t i = 0; i < num; i++)
+  for (uint32_t i = 0; i < 1; i++)
   {
     const LivoxEthPacket &packet = data[i];
     
@@ -67,7 +68,7 @@ void Preprocess::process(const LivoxEthPacket* data, uint32_t num, double timest
     if (packet.data_type == kExtendCartesian)
     {
       const LivoxExtendRawPoint *raw_pts = (const LivoxExtendRawPoint *)packet.data;
-      uint32_t point_num = packet.length / sizeof(LivoxExtendRawPoint);
+      uint32_t point_num = num;
       
       // Note: for multi-point packets, we process each point
       // But typically LivoxEthPacket contains one point per packet in data callback
@@ -78,7 +79,7 @@ void Preprocess::process(const LivoxEthPacket* data, uint32_t num, double timest
         z_arr[valid_count] = raw_pts[j].z / 1000.0f;
         line_arr[valid_count] = 0;
         tag_arr[valid_count] = raw_pts[j].tag;
-        offset_arr[valid_count] = packet.timestamp_point;  // ns offset
+        offset_arr[valid_count] = 0;  // SDK1 packets do not carry per-point offsets here
         valid_count++;
       }
     }

@@ -8,11 +8,13 @@
 #include <thread>
 #include <functional>
 #include <atomic>
+#include <vector>
 #include "types.h"
 #include "livox_sdk.h"
+#include "lvx_reader.h"
 
 // Callback types
-using LidarDataCallback = std::function<void(const LivoxEthPacket* data, uint32_t num, double timestamp)>;
+using LidarDataCallback = std::function<void(const std::vector<LvxPoint>& points, double timestamp)>;
 using ImuDataCallback = std::function<void(const ImuData& imu)>;
 
 class LivoxAdapter
@@ -34,13 +36,21 @@ public:
     bool getImuData(ImuData& imu, int timeout_ms = 100);
 
 private:
-    static void OnDeviceConnect(const uint8_t dev_type, const char* serial_num, const char* user_data);
-    static void OnDeviceChange(const uint8_t dev_type, const char* serial_num, uint8_t state);
+    static void OnDeviceBroadcast(const BroadcastDeviceInfo* info);
+    static void OnDeviceChange(const DeviceInfo* info, DeviceEvent type);
+    static void OnSampleCallback(livox_status status, uint8_t handle, uint8_t response, void* client_data);
+    static void OnStopSampleCallback(livox_status status, uint8_t handle, uint8_t response, void* client_data);
+    static void OnDeviceInformation(livox_status status, uint8_t handle, DeviceInformationResponse* response, void* client_data);
+    static void OnErrorStatus(livox_status status, uint8_t handle, ErrorMessage* message);
     static void OnDataCallback(uint8_t handle, LivoxEthPacket* data, uint32_t data_num, void* client_data);
 
     std::atomic<bool> connected_{false};
     std::atomic<bool> running_{false};
+    std::atomic<bool> sampling_{false};
+    std::atomic<bool> sdk_started_{false};
     uint8_t device_handle_;
+    std::string target_broadcast_code_;
+    std::mutex state_mutex_;
 
     LidarDataCallback lidar_cb_;
     ImuDataCallback imu_cb_;

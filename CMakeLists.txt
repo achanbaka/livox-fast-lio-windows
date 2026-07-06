@@ -71,12 +71,9 @@ find_path(LZ4_INCLUDE_DIR NAMES lz4.h
 find_library(LZ4_LIBRARY NAMES lz4)
 
 # ─── Livox SDK ─────────────────────────────────────────────────────
-# We use a minimal livox_sdk.h header in include/.
-# When the full Livox-SDK is available, set LIVOX_SDK_DIR to its path.
 set(LIVOX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Livox-SDK")
 if(EXISTS "${LIVOX_SDK_DIR}/sdk_core/include/livox_sdk.h")
     set(LIVOX_SDK_INCLUDE_DIRS "${LIVOX_SDK_DIR}/sdk_core/include")
-    # Try to find the pre-built static library
     find_library(LIVOX_SDK_LIB
         NAMES livox_sdk_static
         PATHS "${LIVOX_SDK_DIR}/sdk_core/lib/x64"
@@ -87,8 +84,12 @@ if(EXISTS "${LIVOX_SDK_DIR}/sdk_core/include/livox_sdk.h")
         set(LIVOX_SDK_LIBS ${LIVOX_SDK_LIB})
         message(STATUS "Livox SDK found: ${LIVOX_SDK_LIB}")
     else()
-        message(WARNING "Livox SDK headers found but library not built. Using stub.")
-        set(LIVOX_SDK_LIBS "")
+        message(STATUS "Livox SDK headers found; building sdk_core from source.")
+        set(_FAST_LIO_PROJECT_NAME "${PROJECT_NAME}")
+        set(PROJECT_NAME livox_sdk)
+        add_subdirectory("${LIVOX_SDK_DIR}/sdk_core" "${CMAKE_CURRENT_BINARY_DIR}/Livox-SDK/sdk_core" EXCLUDE_FROM_ALL)
+        set(PROJECT_NAME "${_FAST_LIO_PROJECT_NAME}")
+        set(LIVOX_SDK_LIBS livox_sdk_static)
     endif()
 else()
     message(STATUS "Using minimal livox_sdk.h from include/ (SDK not found in third_party/)")
@@ -103,12 +104,12 @@ set(IKFOM_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 
 # ─── Include directories ───────────────────────────────────────────
 include_directories(
+    ${LIVOX_SDK_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${EIGEN3_INCLUDE_DIR}
     ${PCL_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIR}
-    ${LIVOX_SDK_INCLUDE_DIRS}
     ${IKFOM_INCLUDE}
 )
 
@@ -128,8 +129,13 @@ set(FAST_LIO_SOURCES
     src/bag_writer.cpp
     src/yaml_config.cpp
     include/ikd-Tree/ikd_Tree.cpp
-    src/livox_sdk_stub.cpp
 )
+
+if(LIVOX_SDK_LIBS)
+    string(REPLACE "\\" "/" LIVOX_REAL_SDK_HEADER "${LIVOX_SDK_DIR}/sdk_core/include/livox_sdk.h")
+else()
+    list(APPEND FAST_LIO_SOURCES src/livox_sdk_stub.cpp)
+endif()
 
 # ─── Executable ─────────────────────────────────────────────────────
 add_executable(livox_fast_lio ${FAST_LIO_SOURCES})
@@ -142,6 +148,12 @@ target_link_libraries(livox_fast_lio
     ws2_32    # Windows sockets
     bcrypt    # Windows crypto support
 )
+
+if(LIVOX_SDK_LIBS)
+    target_compile_definitions(livox_fast_lio PRIVATE
+        LIVOX_USE_REAL_SDK=1
+        LIVOX_REAL_SDK_HEADER="${LIVOX_REAL_SDK_HEADER}")
+endif()
 
 # bzip2 for bag decompression
 if(BZIP2_FOUND)

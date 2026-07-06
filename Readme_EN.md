@@ -71,7 +71,7 @@ This project uses [vcpkg](https://vcpkg.io/) to manage core C++ dependencies. Se
 | **Foxglove C++ SDK** | Official Foxglove WebSocket and protobuf schema publishing, located at `third_party/foxglove-sdk/` |
 | **bzip2** | bzip2 decompression support for bag files |
 | **lz4** | lz4 decompression support for bag files |
-| **Livox SDK source** | Reference for LVX SDK1 data structures; included under `third_party/Livox-SDK` and not required for linking during build |
+| **Livox SDK source** | Real-time Horizon connection and LVX SDK1 data structure reference; included under `third_party/Livox-SDK`, and CMake builds and links `livox_sdk_static` automatically |
 
 Installation steps:
 
@@ -107,6 +107,7 @@ build\Release\livox_fast_lio.exe
 ```
 
 > **Tip:** CMake automatically copies the `config/` directory to `build\config/` and deploys all dependency DLLs to `build\Release/`.
+> If `third_party/Livox-SDK` exists, CMake builds `sdk_core` and links the real Livox SDK automatically. It falls back to `src/livox_sdk_stub.cpp` only when the SDK is absent.
 
 ---
 
@@ -134,6 +135,9 @@ livox_fast_lio.exe [config_path] [--lvx <file>] [--bag <file>] [key=value ...]
 
 # Specify a configuration file
 .\livox_fast_lio.exe D:\path\to\horizon.yaml
+
+# Use the high-density Horizon configuration
+.\livox_fast_lio.exe config\horizon_hd.yaml pcd_save_en=false
 
 # Replay an LVX file. For long recordings, disable PCD saving first.
 .\livox_fast_lio.exe config\horizon.yaml --lvx "D:\data\recording.lvx" pcd_save_en=false
@@ -164,11 +168,11 @@ After startup, the program will:
 
 1. Load the `config/horizon.yaml` configuration
 2. Start the Foxglove WebSocket server on port 8765
-3. Initialize Livox SDK and wait for the device connection
-4. Receive LiDAR + IMU data and run the FAST-LIO2 algorithm
+3. Initialize Livox SDK, listen for Livox broadcasts on the LAN, and connect to one Horizon device
+4. Receive LiDAR + IMU data after sampling starts and feed real-time frames into FAST-LIO2
 5. Output pose estimation and the point cloud map in real time
 
-> **Note:** The current version uses a Livox SDK stub, `livox_sdk_stub.cpp`. Real-time mode requires replacing the stub with the real SDK implementation before it can connect to hardware. See [Connecting a Real Livox LiDAR](#connecting-a-real-livox-lidar).
+The live path is currently designed for a single Livox Horizon device. If multiple Livox devices are present on the same LAN, use `livox_broadcast_code=...` to lock onto one device and avoid mixing data streams.
 
 ### LVX Playback Mode
 
@@ -285,12 +289,17 @@ The output bag contains the following topics:
 
 Default configuration file: [`config/horizon.yaml`](config/horizon.yaml)
 
+High-density configuration: [`config/horizon_hd.yaml`](config/horizon_hd.yaml). It reduces `filter_size_surf` and `filter_size_map` from `0.5 m` to `0.2 m`, and sets `point_filter_num` to `1` for denser mapping. This improves map density but increases CPU and memory usage.
+
 ### common — General Settings
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `lid_topic` | string | `/livox/lidar` | LiDAR data topic. Reserved field; the Windows version does not use ROS topics |
 | `imu_topic` | string | `/livox/imu` | IMU data topic |
+| `livox_broadcast_code` | string | `""` | Optional Livox broadcast-code filter in live mode. Empty string means connect to the discovered device automatically |
+| `realtime_frame_sec` | double | `0.10` | Live-mode accumulation window, in seconds, for one FAST-LIO frame |
+| `realtime_frame_points` | int | `20000` | Live-mode point threshold that can flush one FAST-LIO frame early |
 | `time_sync_en` | bool | `false` | Whether to enable external time synchronization, only used when hardware synchronization is unavailable |
 | `time_offset_lidar_to_imu` | double | `0.0` | LiDAR-IMU time offset in seconds, calibrated by tools such as LI-Init |
 
@@ -355,7 +364,8 @@ livox-fast-lio-windows/
 ├── CMakeLists.txt              # CMake build configuration
 ├── vcpkg.json                  # vcpkg dependency manifest (manifest mode)
 ├── config/
-│   └── horizon.yaml            # Default Livox Horizon configuration
+│   ├── horizon.yaml            # Default Livox Horizon configuration (0.5 m voxels)
+│   └── horizon_hd.yaml         # High-density Livox Horizon configuration (0.2 m voxels)
 ├── include/
 │   ├── common_lib.h            # Common utility functions
 │   ├── Exp_mat.h               # Exponential map / SO3 math utilities
@@ -369,7 +379,7 @@ livox-fast-lio-windows/
 │   ├── lidar_imu_sync.h        # LiDAR/IMU frame-end coverage synchronization check
 │   ├── map_accumulator.h       # Full accumulated map cache for Foxglove/Bag output
 │   ├── livox_adapter.h         # Livox SDK adapter
-│   ├── livox_sdk.h             # Minimal Livox SDK header
+│   ├── livox_sdk.h             # Livox SDK compatibility header; forwards to the official header when available
 │   ├── lvx_reader.h            # LVX file reading and playback
 │   ├── foxglove_publisher.h    # Foxglove WebSocket publisher
 │   ├── ros_message.h           # ROS message serialization/deserialization, header-only
@@ -385,7 +395,7 @@ livox-fast-lio-windows/
 │   ├── laser_mapping.cpp       # FAST-LIO2 core SLAM loop
 │   ├── preprocess.cpp          # Point cloud preprocessing implementation
 │   ├── livox_adapter.cpp       # Livox SDK adapter implementation
-│   ├── livox_sdk_stub.cpp      # Livox SDK stub, used without hardware
+│   ├── livox_sdk_stub.cpp      # Livox SDK stub, used only when the official SDK is absent
 │   ├── lvx_reader.cpp          # LVX playback implementation
 │   ├── foxglove_publisher.cpp  # Official Foxglove SDK WebSocket publishing implementation
 │   ├── ros_bag.cpp             # Low-level bag parsing: decompression and record parsing
@@ -428,27 +438,49 @@ PCD files can be viewed with:
 
 ## Connecting a Real Livox LiDAR
 
-The current project uses a Livox SDK stub, `src/livox_sdk_stub.cpp`, where all SDK functions return empty values. To connect real hardware:
+The repository includes `third_party/Livox-SDK`. CMake builds the official SDK1 `sdk_core` target and links it into `livox_fast_lio.exe` automatically. The live connection flow is:
 
-1. **Get Livox SDK**
+1. Initialize Livox SDK
+2. Listen for Livox device broadcasts on the LAN
+3. Add the target Horizon with `AddLidarToConnect(...)`
+4. Start sampling with `LidarStartSampling(...)` after the device reaches `Normal`
+5. Feed live point cloud and IMU data into FAST-LIO2
 
-   ```powershell
-   cd third_party
-   git clone https://github.com/Livox-SDK/Livox-SDK.git
-   ```
+If your local checkout is missing `third_party/Livox-SDK`, fetch the official SDK:
 
-2. **Build the SDK**
+```powershell
+cd third_party
+git clone https://github.com/Livox-SDK/Livox-SDK.git
+```
 
-   ```powershell
-   cd Livox-SDK
-   mkdir build && cd build
-   cmake .. -DCMAKE_BUILD_TYPE=Release
-   cmake --build . --config Release
-   ```
+Then reconfigure and rebuild the main project:
 
-3. **Switch to the real SDK implementation** — CMake attempts to detect the headers and libraries under `third_party/Livox-SDK`. The current repository still includes `src/livox_sdk_stub.cpp` by default as the no-hardware build entry. For real-time hardware operation, disable the stub implementation and link the official SDK library.
+```powershell
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=third_party/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release -j16
+```
 
-4. **Configure the network** — Ensure the PC network adapter IP is in the `192.168.1.x` subnet, which is the Livox default, with subnet mask `255.255.255.0`.
+**Network setup:** Make sure the PC network adapter and Horizon are on the same subnet, and that the firewall allows Livox SDK UDP broadcast and data ports. Use `ping <device-ip>` first to confirm basic connectivity. For a single-device setup, no IP option is required; the SDK discovers the device through broadcasts.
+
+Live mapping command:
+
+```powershell
+.\build\Release\livox_fast_lio.exe .\config\horizon.yaml pcd_save_en=false
+```
+
+High-density mapping command:
+
+```powershell
+.\build\Release\livox_fast_lio.exe .\config\horizon_hd.yaml pcd_save_en=false
+```
+
+The sampling path is up when the log contains:
+
+```text
+[LivoxAdapter] Broadcast: code=...
+[LivoxAdapter] Added LiDAR handle=...
+[LivoxAdapter] Start sampling callback status=0 ... response=0
+```
 
 ---
 
@@ -469,7 +501,12 @@ cd build\Release
 
 ### Q: It reports "SDK init failed"
 
-This is expected behavior when the Livox SDK stub is used. Real-time mode cannot connect to hardware with the stub. To run with real hardware, install the real SDK as described in [Connecting a Real Livox LiDAR](#connecting-a-real-livox-lidar).
+This usually means the program did not link or initialize the real Livox SDK successfully. Check:
+
+1. `third_party/Livox-SDK` exists and contains `sdk_core/include/livox_sdk.h`
+2. The CMake configure log contains `Livox SDK headers found; building sdk_core from source.`
+3. The build produced `build\Livox-SDK\sdk_core\Release\livox_sdk_static.lib`
+4. You re-ran `cmake -B build -S . ...` and `cmake --build build --config Release`
 
 LVX and Bag playback do not depend on a real-time Livox SDK connection and can be used offline normally.
 

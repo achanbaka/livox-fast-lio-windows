@@ -71,7 +71,7 @@
 | **Foxglove C++ SDK** | 官方 Foxglove WebSocket 与 protobuf schema 发布（位于 `third_party/foxglove-sdk/`） |
 | **bzip2** | Bag 文件 bzip2 解压支持 |
 | **lz4** | Bag 文件 lz4 解压支持 |
-| **Livox SDK 源码** | LVX SDK1 数据结构对照；已放在 `third_party/Livox-SDK`，构建时不强制链接 |
+| **Livox SDK 源码** | 实时 Horizon 连接与 LVX SDK1 数据结构对照；已放在 `third_party/Livox-SDK`，CMake 会自动构建并链接 `livox_sdk_static` |
 
 安装步骤：
 
@@ -107,6 +107,7 @@ build\Release\livox_fast_lio.exe
 ```
 
 > **提示：** CMake 会自动将 `config/` 目录复制到 `build\config/`，并将所有依赖 DLL 部署到 `build\Release/`。
+> 如果 `third_party/Livox-SDK` 存在，CMake 会自动构建 `sdk_core` 并链接真实 Livox SDK；只有 SDK 不存在时才会回退到 `src/livox_sdk_stub.cpp`。
 
 ---
 
@@ -134,6 +135,9 @@ livox_fast_lio.exe [config_path] [--lvx <file>] [--bag <file>] [key=value ...]
 
 # 指定配置文件
 .\livox_fast_lio.exe D:\path\to\horizon.yaml
+
+# 使用高精度 Horizon 配置
+.\livox_fast_lio.exe config\horizon_hd.yaml pcd_save_en=false
 
 # 回放 LVX 文件，长时间数据建议先关闭 PCD 保存
 .\livox_fast_lio.exe config\horizon.yaml --lvx "D:\data\recording.lvx" pcd_save_en=false
@@ -163,11 +167,11 @@ cd build\Release
 程序启动后会：
 1. 加载 `config/horizon.yaml` 配置
 2. 启动 Foxglove WebSocket 服务器（端口 8765）
-3. 初始化 Livox SDK，等待设备连接
-4. 接收 LiDAR + IMU 数据，运行 FAST-LIO2 算法
+3. 初始化 Livox SDK，监听内网设备广播并自动连接单台 Horizon
+4. 进入采样后接收 LiDAR + IMU 数据，按实时建帧窗口推入 FAST-LIO2
 5. 实时输出位姿估计与点云地图
 
-> **注意：** 当前版本使用 Livox SDK 存根（`livox_sdk_stub.cpp`），实时模式需要替换为真实 SDK 才能连接硬件。详见 [连接真实 Livox LiDAR](#连接真实-livox-lidar)。
+默认按单台 Livox Horizon 设备设计；如果内网里存在多台 Livox 设备，建议使用 `livox_broadcast_code=...` 锁定目标设备，避免多台数据混入同一个建图输入流。
 
 ### LVX 回放模式
 
@@ -282,12 +286,17 @@ SLAM 完成后，用 Foxglove Studio 直接打开输出 bag 文件：
 
 默认配置文件：[`config/horizon.yaml`](config/horizon.yaml)
 
+另提供高精度配置：[`config/horizon_hd.yaml`](config/horizon_hd.yaml)。它将 `filter_size_surf` 和 `filter_size_map` 从 `0.5m` 降到 `0.2m`，并将 `point_filter_num` 调为 `1`，适合需要更高点云密度的现场建图，但会增加 CPU 和内存压力。
+
 ### common — 通用设置
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `lid_topic` | string | `/livox/lidar` | LiDAR 数据话题（保留字段，Windows 版不使用 ROS 话题） |
 | `imu_topic` | string | `/livox/imu` | IMU 数据话题 |
+| `livox_broadcast_code` | string | `""` | 实时模式下可选的 Livox 设备广播码过滤；空字符串表示自动连接发现到的设备 |
+| `realtime_frame_sec` | double | `0.10` | 实时模式下累计多少秒点云组成一帧 FAST-LIO 输入 |
+| `realtime_frame_points` | int | `20000` | 实时模式下累计点数达到该值时提前组成一帧 |
 | `time_sync_en` | bool | `false` | 是否启用外部时间同步（仅在无法硬件同步时开启） |
 | `time_offset_lidar_to_imu` | double | `0.0` | LiDAR-IMU 时间偏移（秒），由 LI-Init 等工具标定 |
 
@@ -352,7 +361,8 @@ livox-fast-lio-windows/
 ├── CMakeLists.txt              # CMake 构建配置
 ├── vcpkg.json                  # vcpkg 依赖清单 (manifest mode)
 ├── config/
-│   └── horizon.yaml            # Livox Horizon 默认配置
+│   ├── horizon.yaml            # Livox Horizon 默认配置（0.5m 体素）
+│   └── horizon_hd.yaml         # Livox Horizon 高精度配置（0.2m 体素）
 ├── include/
 │   ├── common_lib.h            # 通用工具函数
 │   ├── Exp_mat.h               # 指数映射 / SO3 数学工具
@@ -366,7 +376,7 @@ livox-fast-lio-windows/
 │   ├── lidar_imu_sync.h        # LiDAR/IMU 帧尾覆盖同步判定
 │   ├── map_accumulator.h       # Foxglove/Bag 输出用完整累计地图缓存
 │   ├── livox_adapter.h         # Livox SDK 适配器
-│   ├── livox_sdk.h             # 最小化 Livox SDK 头文件
+│   ├── livox_sdk.h             # Livox SDK 兼容头；真实 SDK 存在时转发到官方头文件
 │   ├── lvx_reader.h            # LVX 文件读取与回放
 │   ├── foxglove_publisher.h    # Foxglove WebSocket 发布器
 │   ├── ros_message.h           # ROS 消息序列化/反序列化（header-only）
@@ -382,7 +392,7 @@ livox-fast-lio-windows/
 │   ├── laser_mapping.cpp       # FAST-LIO2 核心 SLAM 循环
 │   ├── preprocess.cpp          # 点云预处理实现
 │   ├── livox_adapter.cpp       # Livox SDK 适配实现
-│   ├── livox_sdk_stub.cpp      # Livox SDK 存根（无硬件时使用）
+│   ├── livox_sdk_stub.cpp      # Livox SDK 存根（未找到官方 SDK 时使用）
 │   ├── lvx_reader.cpp          # LVX 回放实现
 │   ├── foxglove_publisher.cpp  # 官方 Foxglove SDK WebSocket 发布实现
 │   ├── ros_bag.cpp             # Bag 底层解析（解压、record 解析）
@@ -424,25 +434,49 @@ PCD 文件可使用以下工具查看：
 
 ## 连接真实 Livox LiDAR
 
-当前项目使用 Livox SDK 存根（`src/livox_sdk_stub.cpp`），所有 SDK 函数返回空值。要连接真实硬件：
+仓库已包含 `third_party/Livox-SDK`，CMake 会自动构建官方 SDK1 的 `sdk_core` 并链接到 `livox_fast_lio.exe`。实时模式的连接流程为：
 
-1. **获取 Livox SDK**
-   ```powershell
-   cd third_party
-   git clone https://github.com/Livox-SDK/Livox-SDK.git
-   ```
+1. 初始化 Livox SDK
+2. 监听内网中的 Livox 设备广播
+3. 调用 `AddLidarToConnect(...)` 添加目标 Horizon
+4. 设备进入 `Normal` 状态后调用 `LidarStartSampling(...)`
+5. 将实时点云和 IMU 数据送入 FAST-LIO2
 
-2. **编译 SDK**
-   ```powershell
-   cd Livox-SDK
-   mkdir build && cd build
-   cmake .. -DCMAKE_BUILD_TYPE=Release
-   cmake --build . --config Release
-   ```
+如果你的本地仓库缺少 `third_party/Livox-SDK`，可以重新获取官方 SDK：
 
-3. **切换实时 SDK 实现** — CMake 会尝试检测 `third_party/Livox-SDK` 的头文件和库；当前仓库仍默认包含 `src/livox_sdk_stub.cpp` 作为无硬件构建入口。如需真实硬件实时运行，请禁用存根实现并链接官方 SDK 库。
+```powershell
+cd third_party
+git clone https://github.com/Livox-SDK/Livox-SDK.git
+```
 
-4. **网络配置** — 确保 PC 网卡 IP 设置为 `192.168.1.x` 网段（Livox 默认），子网掩码 `255.255.255.0`。
+然后重新配置和编译主工程：
+
+```powershell
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=third_party/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release -j16
+```
+
+**网络配置：** 确保 PC 网卡和 Horizon 在同一网段，且防火墙允许 Livox SDK 的 UDP 广播与数据端口。你可以先用 `ping <设备IP>` 确认基础网络连通。单台设备场景下无需指定 IP，SDK 会通过广播自动发现设备。
+
+实时建图命令：
+
+```powershell
+.\build\Release\livox_fast_lio.exe .\config\horizon.yaml pcd_save_en=false
+```
+
+高精度建图命令：
+
+```powershell
+.\build\Release\livox_fast_lio.exe .\config\horizon_hd.yaml pcd_save_en=false
+```
+
+启动日志中出现以下内容时，表示设备采样链路已经起来：
+
+```text
+[LivoxAdapter] Broadcast: code=...
+[LivoxAdapter] Added LiDAR handle=...
+[LivoxAdapter] Start sampling callback status=0 ... response=0
+```
 
 ---
 
@@ -463,7 +497,12 @@ cd build\Release
 
 ### Q: 提示 "SDK init failed"
 
-这是预期行为。当前使用 Livox SDK 存根，实时模式无法连接硬件。如需实时运行，请参考 [连接真实 Livox LiDAR](#连接真实-livox-lidar) 安装真实 SDK。
+这通常表示程序没有成功链接或初始化真实 Livox SDK。请检查：
+
+1. `third_party/Livox-SDK` 是否存在，且包含 `sdk_core/include/livox_sdk.h`
+2. CMake 配置日志中是否出现 `Livox SDK headers found; building sdk_core from source.`
+3. 构建产物中是否生成 `build\Livox-SDK\sdk_core\Release\livox_sdk_static.lib`
+4. 是否重新执行过 `cmake -B build -S . ...` 和 `cmake --build build --config Release`
 
 LVX 和 Bag 回放不依赖实时 Livox SDK 连接，可正常离线使用。
 

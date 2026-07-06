@@ -1,0 +1,101 @@
+{
+  "cameraState": {
+    "perspective": true,
+    "distance": 322.2015233264791,
+    "phi": 102.71232596649449,
+    "thetaOffset": 100.78806263030167,
+    "targetOffset": [
+      7.9501660891422725,
+      -15.233039400526462,
+      57.3437913556254
+    ],
+    "target": [
+      0,
+      0,
+      0
+    ],
+    "targetOrientation": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "fovy": 45,
+    "near": 0.5,
+    "far": 5000
+  },
+  "followMode": "follow-pose",
+  "followTf": "base_link",
+  "fixedFrame": "map",
+  "scene": {
+    "enableStats": true,
+    "syncCamera": false
+  },
+  "transforms": {
+    "frame:map": {
+      "visible": true
+    },
+    "frame:base_link": {
+      "visible": true
+    }
+  },
+  "topics": {
+    "/cloud_registered": {
+      "visible": true,
+      "colorField": "intensity",
+      "colorMode": "colormap",
+      "colorMap": "turbo",
+      "pointSize": 1.5,
+      "decayTime": 0.5
+    },
+    "/path": {
+      "visible": true,
+      "type": "line",
+      "gradient": [
+        "#ffb8662b",
+        "#ff9666ff"
+      ],
+      "lineWidth": 0.2
+    },
+    "/map": {
+      "visible": true,
+      "colorField": "intensity",
+      "colorMode": "colormap",
+      "colorMap": "turbo",
+      "pointSize": 1.5
+    }
+  },
+  "layers": {
+    "grid": {
+      "visible": true,
+      "drawBehind": false,
+      "instanceId": "56c7ef8a-53c2-45ea-95a8-89c4c06a5689",
+      "layerId": "foxglove.Grid",
+      "size": 10,
+      "divisions": 10,
+      "lineWidth": 1,
+      "color": "#248eff",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "publish": {
+    "type": "point",
+    "poseTopic": "/move_base_simple/goal",
+    "pointTopic": "/clicked_point",
+    "poseEstimateTopic": "/initialpose",
+    "poseEstimateXDeviation": 0.5,
+    "poseEstimateYDeviation": 0.5,
+    "poseEstimateThetaDeviation": 0.26179939
+  },
+  "synchronize": false,
+  "imageMode": {}
+}

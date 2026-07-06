@@ -9,6 +9,9 @@ YamlConfig::YamlConfig()
     config_.imu_topic = "/livox/imu";
     config_.time_sync_en = false;
     config_.time_offset_lidar_to_imu = 0.0;
+    config_.livox_broadcast_code = "";
+    config_.realtime_frame_sec = 0.10;
+    config_.realtime_frame_points = 20000;
     config_.lidar_type = 1;
     config_.scan_line = 6;
     config_.blind = 4.0;
@@ -53,6 +56,9 @@ bool YamlConfig::load(const std::string& filepath)
             if (common["imu_topic"]) config_.imu_topic = common["imu_topic"].as<std::string>();
             if (common["time_sync_en"]) config_.time_sync_en = common["time_sync_en"].as<bool>();
             if (common["time_offset_lidar_to_imu"]) config_.time_offset_lidar_to_imu = common["time_offset_lidar_to_imu"].as<double>();
+            if (common["livox_broadcast_code"]) config_.livox_broadcast_code = common["livox_broadcast_code"].as<std::string>();
+            if (common["realtime_frame_sec"]) config_.realtime_frame_sec = common["realtime_frame_sec"].as<double>();
+            if (common["realtime_frame_points"]) config_.realtime_frame_points = common["realtime_frame_points"].as<int>();
         }
 
         // Preprocess section
@@ -167,6 +173,9 @@ void YamlConfig::applyOverrides(int argc, char* argv[])
             else if (key == "max_feature_points") config_.max_feature_points = std::stoi(val);
             else if (key == "publish_full_map") config_.publish_full_map = (val == "true" || val == "1");
             else if (key == "root_dir") config_.root_dir = val;
+            else if (key == "livox_broadcast_code") config_.livox_broadcast_code = val;
+            else if (key == "realtime_frame_sec") config_.realtime_frame_sec = std::stod(val);
+            else if (key == "realtime_frame_points") config_.realtime_frame_points = std::stoi(val);
         }
         catch (...)
         {

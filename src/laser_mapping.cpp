@@ -35,6 +35,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -922,11 +923,13 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     unique_ptr<LivoxAdapter> livox_adapter;
     unique_ptr<BagReader>    bag_reader;
 
-    // Shared storage for adapter raw-packet accumulation
-    PointCloudXYZI::Ptr adapter_accum_cloud(new PointCloudXYZI());
+    // Shared storage for real-time adapter point accumulation
+    vector<LvxPoint>    adapter_accum_points;
     double              adapter_accum_time = 0.0;
     mutex               adapter_accum_mtx;
-    const int           ACCUM_PACKET_THRESHOLD = 10;
+    const double        ACCUM_FRAME_SEC = max(0.01, config.realtime_frame_sec);
+    const size_t        ACCUM_POINT_THRESHOLD =
+        static_cast<size_t>(max(1000, config.realtime_frame_points));
     atomic<uint64_t>    playback_current_time_ns{0};
     atomic<double>      playback_speed{1.0};
     atomic<bool>        playback_paused{false};
@@ -989,25 +992,48 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         }
 
         livox_adapter->setLidarCallback(
-            [&adapter_accum_cloud, &adapter_accum_time, &adapter_accum_mtx, ACCUM_PACKET_THRESHOLD]
-            (const LivoxEthPacket *data, uint32_t num, double timestamp)
+            [&adapter_accum_points, &adapter_accum_time, &adapter_accum_mtx,
+             ACCUM_FRAME_SEC, ACCUM_POINT_THRESHOLD]
+            (const vector<LvxPoint> &points, double timestamp)
             {
-                PointCloudXYZI::Ptr tmp(new PointCloudXYZI());
-                p_pre.process(data, num, timestamp, tmp);
+                if (points.empty()) {
+                    return;
+                }
 
-                lock_guard<mutex> lock(adapter_accum_mtx);
-                if (adapter_accum_cloud->empty())
-                    adapter_accum_time = timestamp;
+                vector<LvxPoint> ready_points;
+                double ready_time = 0.0;
 
-                for (auto &p : tmp->points)
-                    adapter_accum_cloud->push_back(p);
-
-                if (num >= ACCUM_PACKET_THRESHOLD)
                 {
-                    PointCloudXYZI::Ptr frame(new PointCloudXYZI());
-                    *frame = *adapter_accum_cloud;
-                    adapter_accum_cloud->clear();
-                    pushLidarFrame(frame, adapter_accum_time);
+                    lock_guard<mutex> lock(adapter_accum_mtx);
+                    if (adapter_accum_points.empty()) {
+                        adapter_accum_time = timestamp;
+                    }
+
+                    const double frame_dt = max(0.0, timestamp - adapter_accum_time);
+                    const uint32_t offset_ns =
+                        static_cast<uint32_t>(min(frame_dt * 1e9,
+                                                  static_cast<double>(numeric_limits<uint32_t>::max())));
+
+                    adapter_accum_points.reserve(adapter_accum_points.size() + points.size());
+                    for (const auto &point : points) {
+                        LvxPoint adjusted = point;
+                        adjusted.offset_time = offset_ns;
+                        adapter_accum_points.push_back(adjusted);
+                    }
+
+                    if (frame_dt >= ACCUM_FRAME_SEC ||
+                        adapter_accum_points.size() >= ACCUM_POINT_THRESHOLD) {
+                        ready_points.swap(adapter_accum_points);
+                        ready_time = adapter_accum_time;
+                        adapter_accum_time = timestamp;
+                    }
+                }
+
+                if (!ready_points.empty()) {
+                    PointCloudXYZI::Ptr frame = preprocessLivoxPoints(ready_points, ready_time);
+                    if (!frame->empty()) {
+                        pushLidarFrame(frame, ready_time);
+                    }
                 }
             });
 
@@ -1095,7 +1121,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     }
     else if (livox_adapter)
     {
-        livox_adapter->start();
+        livox_adapter->start(config.livox_broadcast_code);
         cout << "[LaserMapping] Livox adapter started, waiting for data..." << endl;
     }
 
