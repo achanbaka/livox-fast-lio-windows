@@ -19,6 +19,17 @@
 
 namespace fs = std::filesystem;
 
+static std::string resolveOutputRoot(const std::string& configured_root)
+{
+    if (configured_root.empty() || configured_root == "." ||
+        configured_root == "./" || configured_root == ".\\")
+    {
+        return fs::current_path().lexically_normal().string();
+    }
+
+    return fs::absolute(fs::path(configured_root)).lexically_normal().string();
+}
+
 void printUsage(const char* prog)
 {
     std::cout << "Livox FAST-LIO Windows SLAM\n"
@@ -50,8 +61,9 @@ int main(int argc, char* argv[])
     bool use_bag = false;
     std::vector<std::string> overrides;
 
-    // Determine root directory (where the executable is or ROOT_DIR)
-    std::string root_dir = ROOT_DIR;
+    // ROOT_DIR is the source tree. Runtime output defaults to the current
+    // working directory so ./Log and ./PCD match where the app is launched.
+    std::string source_root_dir = ROOT_DIR;
     
     for (int i = 1; i < argc; i++)
     {
@@ -105,8 +117,8 @@ int main(int argc, char* argv[])
         // Try relative to executable and ROOT_DIR
         if (fs::exists("config/horizon.yaml"))
             config_path = "config/horizon.yaml";
-        else if (fs::exists(root_dir + "config/horizon.yaml"))
-            config_path = root_dir + "config/horizon.yaml";
+        else if (fs::exists(fs::path(source_root_dir) / "config/horizon.yaml"))
+            config_path = (fs::path(source_root_dir) / "config/horizon.yaml").string();
         else
         {
             std::cerr << "Error: config/horizon.yaml not found." << std::endl;
@@ -125,7 +137,8 @@ int main(int argc, char* argv[])
 
     // Apply overrides
     yaml_config.applyOverrides(argc, argv);
-    yaml_config.getConfig().root_dir = root_dir;
+    const std::string output_root = resolveOutputRoot(yaml_config.getConfig().root_dir);
+    yaml_config.getConfig().root_dir = output_root;
 
     // Validate input paths
     if (use_lvx)
@@ -152,8 +165,10 @@ int main(int argc, char* argv[])
     }
 
     // Create output directories
-    fs::create_directories(root_dir + "Log");
-    fs::create_directories(root_dir + "PCD");
+    fs::create_directories(fs::path(output_root) / "Log");
+    fs::create_directories(fs::path(output_root) / "PCD");
+    std::cout << "Output root: " << output_root << std::endl;
+    std::cout << "Log directory: " << (fs::path(output_root) / "Log").string() << std::endl;
 
     // Run SLAM
     runLaserMapping(yaml_config.getConfig(), use_lvx, lvx_path, use_bag, bag_path);

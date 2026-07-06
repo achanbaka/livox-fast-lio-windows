@@ -17,8 +17,10 @@ compile_commands.json
 docs/
 
 # Runtime outputs and captured data
-Log/
-PCD/
+Log/*
+!Log/1
+PCD/*
+!PCD/1
 *.pcd
 *.bag
 *.lvx

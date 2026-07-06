@@ -276,6 +276,14 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     }
     double &&offs_t = tail->timestamp - pcl_beg_time;
     IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+    if (fout_imu.is_open())
+    {
+      fout_imu << tail->timestamp << ' '
+               << imu_state.pos(0) << ' ' << imu_state.pos(1) << ' ' << imu_state.pos(2) << ' '
+               << imu_state.vel(0) << ' ' << imu_state.vel(1) << ' ' << imu_state.vel(2) << ' '
+               << acc_s_last(0) << ' ' << acc_s_last(1) << ' ' << acc_s_last(2) << ' '
+               << angvel_last(0) << ' ' << angvel_last(1) << ' ' << angvel_last(2) << '\n';
+    }
   }
 
   /*** calculated the pos and attitude prediction at the frame-end ***/
@@ -344,7 +352,6 @@ void ImuProcess::Process(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 1
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
       cout << "IMU Initial Done" << endl;
-      fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 
     return;

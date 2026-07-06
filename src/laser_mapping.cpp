@@ -33,11 +33,14 @@
 #include <condition_variable>
 #include <csignal>
 #include <deque>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -108,6 +111,7 @@ static bool   path_en                = true;
 static bool   scan_bodyframe_pub_en  = false;
 static bool   publish_full_map       = true;
 static string root_dir;
+static ofstream runtime_log;
 static constexpr int MAP_PUBLISH_INTERVAL = 1;
 static constexpr int FULL_MAP_PUBLISH_INTERVAL = 50;
 static constexpr size_t MAX_REPLAY_LIDAR_QUEUE = 3;
@@ -117,6 +121,32 @@ static constexpr int FOXGLOVE_PATH_INTERVAL_MS = 200;
 static constexpr int VERBOSE_SLAM_LOG_INTERVAL = 20;
 static atomic<bool> replay_backpressure_enabled{false};
 static atomic<bool> replay_backpressure_stop{false};
+
+static string resolveOutputRoot(const string& configured_root)
+{
+    namespace fs = std::filesystem;
+    if (configured_root.empty() || configured_root == "." ||
+        configured_root == "./" || configured_root == ".\\")
+    {
+        return fs::current_path().lexically_normal().string();
+    }
+
+    return fs::absolute(fs::path(configured_root)).lexically_normal().string();
+}
+
+static string outputPath(const string& relative_path)
+{
+    return (std::filesystem::path(root_dir) / relative_path).string();
+}
+
+static void writeRuntimeLog(const string& line)
+{
+    if (runtime_log.is_open())
+    {
+        runtime_log << line << '\n';
+        runtime_log.flush();
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Data buffers – filled from callbacks, consumed by sync_packages
@@ -852,7 +882,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     path_en                = config.path_en;
     scan_bodyframe_pub_en  = config.scan_bodyframe_pub_en;
     publish_full_map       = config.publish_full_map;
-    root_dir               = config.root_dir.empty() ? string(ROOT_DIR) : config.root_dir;
+    root_dir               = resolveOutputRoot(config.root_dir);
     replay_backpressure_enabled = use_lvx || use_bag;
     replay_backpressure_stop = false;
 
@@ -880,11 +910,36 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
     // Open IMU debug log
     {
-        // Ensure Log directory exists
-        string log_dir = root_dir + "Log";
-        CreateDirectoryA(log_dir.c_str(), nullptr);
-        string imu_log_path = log_dir + "/imu.txt";
+        // Ensure runtime output directories exist.
+        string log_dir = outputPath("Log");
+        std::filesystem::create_directories(log_dir);
+        std::filesystem::create_directories(outputPath("PCD"));
+
+        string imu_log_path = outputPath("Log/imu.txt");
         imu_proc.fout_imu.open(imu_log_path, ios::out);
+        if (!imu_proc.fout_imu.is_open())
+        {
+            cerr << "[LaserMapping] Failed to open IMU log: " << imu_log_path << endl;
+        }
+        else
+        {
+            imu_proc.fout_imu << "timestamp pos_x pos_y pos_z vel_x vel_y vel_z "
+                              << "acc_x acc_y acc_z gyro_x gyro_y gyro_z" << '\n';
+        }
+
+        string runtime_log_path = outputPath("Log/runtime.txt");
+        runtime_log.open(runtime_log_path, ios::out);
+        if (!runtime_log.is_open())
+        {
+            cerr << "[LaserMapping] Failed to open runtime log: " << runtime_log_path << endl;
+        }
+        else
+        {
+            runtime_log << "FAST-LIO runtime log" << '\n'
+                        << "output_root=" << root_dir << '\n'
+                        << "runtime_pos_log=" << (runtime_pos_log ? "true" : "false") << '\n';
+            runtime_log.flush();
+        }
     }
 
     // ── Foxglove publisher ───────────────────────────────────────────
@@ -1165,8 +1220,8 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
     // Ensure PCD directory exists
     {
-        string pcd_dir = root_dir + "PCD";
-        CreateDirectoryA(pcd_dir.c_str(), nullptr);
+        string pcd_dir = outputPath("PCD");
+        std::filesystem::create_directories(pcd_dir);
     }
 
     cout << "=================================================" << endl;
@@ -1218,13 +1273,29 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         T1 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
         if (!sync_packages(Measures))
         {
+            static int sync_wait_count = 0;
+            sync_wait_count++;
+            if (sync_wait_count % 100 == 0)
+            {
+                writeRuntimeLog("event=sync_wait count=" + to_string(sync_wait_count));
+            }
             this_thread::sleep_for(chrono::milliseconds(10));
             continue;
         }
         T2 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
         s_plot = (T2 - T1) * 1000.0;  // ms
 
-        if (Measures.lidar->points.empty()) continue;
+        if (Measures.lidar->points.empty())
+        {
+            ostringstream log_line;
+            log_line << fixed << setprecision(6)
+                     << "event=skip reason=empty_lidar"
+                     << " lidar_beg=" << Measures.lidar_beg_time
+                     << " lidar_end=" << Measures.lidar_end_time
+                     << " imu=" << Measures.imu.size();
+            writeRuntimeLog(log_line.str());
+            continue;
+        }
 
         // Record first LiDAR time
         if (first_lidar_time < 1.0)
@@ -1234,6 +1305,16 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         // Diagnostic: log SLAM frame processing
         static int slam_frame_count = 0;
         slam_frame_count++;
+        {
+            ostringstream log_line;
+            log_line << fixed << setprecision(6)
+                     << "event=input slam_frame=" << slam_frame_count
+                     << " lidar_points=" << Measures.lidar->points.size()
+                     << " imu=" << Measures.imu.size()
+                     << " lidar_beg=" << Measures.lidar_beg_time
+                     << " lidar_end=" << Measures.lidar_end_time;
+            writeRuntimeLog(log_line.str());
+        }
         const bool verbose_slam_log =
             runtime_pos_log &&
             (slam_frame_count % VERBOSE_SLAM_LOG_INTERVAL == 0);
@@ -1261,6 +1342,12 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 cout << "[LaserMapping] No undistorted points, skipping frame."
                      << " (slam_frame=" << slam_frame_count << ")" << '\n';
             }
+            ostringstream log_line;
+            log_line << "event=skip reason=no_undistorted"
+                     << " slam_frame=" << slam_frame_count
+                     << " lidar_points=" << Measures.lidar->points.size()
+                     << " imu=" << Measures.imu.size();
+            writeRuntimeLog(log_line.str());
             continue;
         }
         if (verbose_slam_log) {
@@ -1294,6 +1381,11 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 too_few_downsampled_log_count % VERBOSE_SLAM_LOG_INTERVAL == 0) {
                 cout << "[LaserMapping] Too few downsampled points, skipping frame." << '\n';
             }
+            ostringstream log_line;
+            log_line << "event=skip reason=too_few_downsampled"
+                     << " slam_frame=" << slam_frame_count
+                     << " points=" << feats_down_size;
+            writeRuntimeLog(log_line.str());
             continue;
         }
 
@@ -1474,7 +1566,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
             if (frame_id > 0 && (frame_id % pcd_interval == 0))
             {
-                string pcd_path = root_dir + "PCD/scans_" + to_string(frame_id) + ".pcd";
+                string pcd_path = outputPath("PCD/scans_" + to_string(frame_id) + ".pcd");
                 pcl::io::savePCDFileASCII(pcd_path, *pcl_wait_save);
                 cout << "[PCD] Saved: " << pcd_path
                      << " (" << pcl_wait_save->size() << " pts)" << endl;
@@ -1500,6 +1592,24 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                    state_point.pos(0), state_point.pos(1), state_point.pos(2),
                    ikdtree.size(), loop_ms);
         }
+
+        ostringstream log_line;
+        log_line << fixed << setprecision(3)
+                 << "event=processed frame=" << frame_id
+                 << " slam_frame=" << slam_frame_count
+                 << " sync_ms=" << s_plot
+                 << " imu_ms=" << s_plot2
+                 << " downsample_ms=" << s_plot3
+                 << " ekf_ms=" << s_plot4
+                 << " map_ms=" << s_plot5
+                 << " publish_ms=" << s_plot6
+                 << " total_ms=" << loop_ms
+                 << " points=" << feats_down_size
+                 << " tree_size=" << ikdtree.size()
+                 << " pos=(" << state_point.pos(0) << ","
+                 << state_point.pos(1) << ","
+                 << state_point.pos(2) << ")";
+        writeRuntimeLog(log_line.str());
 
         frame_id++;
 
@@ -1549,7 +1659,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // Save final PCD if enabled
     if (pcd_save_en && pcl_wait_save->size() > 0)
     {
-        string pcd_path = root_dir + "PCD/scans_final.pcd";
+        string pcd_path = outputPath("PCD/scans_final.pcd");
         pcl::io::savePCDFileASCII(pcd_path, *pcl_wait_save);
         cout << "[PCD] Final cloud saved: " << pcd_path
              << " (" << pcl_wait_save->size() << " pts)" << endl;
@@ -1563,7 +1673,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         {
             PointCloudXYZI map_cloud;
             map_cloud.points = map_storage;
-            string map_path = root_dir + "PCD/ikd_tree_map.pcd";
+            string map_path = outputPath("PCD/ikd_tree_map.pcd");
             pcl::io::savePCDFileASCII(map_path, map_cloud);
             cout << "[PCD] ikd-Tree map saved: " << map_path
                  << " (" << map_cloud.size() << " pts)" << endl;
@@ -1577,6 +1687,11 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // Close IMU log
     if (imu_proc.fout_imu.is_open())
         imu_proc.fout_imu.close();
+    if (runtime_log.is_open())
+    {
+        runtime_log << "total_frames=" << frame_id << '\n';
+        runtime_log.close();
+    }
 
     cout << "[LaserMapping] Total frames processed: " << frame_id << endl;
     cout << "[LaserMapping] Done." << endl;
