@@ -230,15 +230,9 @@ The Windows version applies the same key processing chain as ROS FAST-LIO for Li
 - IEKF uses the original FAST-LIO-style `h_share_model` and `update_iterated_dyn_share_modified(0.001, solve_time)`
 - `/cloud_registered` publishes the current registered frame cloud. When `publish_full_map=true`, `/map` publishes an independent accumulated global map that is no longer affected by local ikd-Tree pruning in FAST-LIO
 
-**How to get a bag file:**
-
-1. Record an `.lvx` file with Livox Viewer
-2. In Livox Viewer, choose **File -> Export** and select ROS Bag format
-3. Use the exported `.bag` file as input to this program
-
 ### Foxglove Visualization
 
-#### Option 1: Real-Time Visualization over WebSocket (Recommended)
+#### Real-Time Visualization over WebSocket
 
 LVX and Bag playback start the Foxglove WebSocket server by default:
 
@@ -264,24 +258,6 @@ Real-time WebSocket topics:
 | `/odometry` | `foxglove.Odometry` | SLAM odometry, with body frame `base_link` |
 | `/path` | `foxglove.PosesInFrame` | Motion trajectory |
 | `/tf` | `foxglove.FrameTransforms` | Coordinate transform from `base_link` to `map` |
-
-#### Option 2: Offline Visualization from Bag Files
-
-After SLAM finishes, open the output bag file directly in Foxglove Studio:
-
-1. Download and install [Foxglove Studio](https://foxglove.dev/download)
-2. Open Foxglove Studio and select **File -> Open File**
-3. Select `test2_output.bag`, the SLAM output file
-
-The output bag contains the following topics:
-
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/odometry` | `geometry_msgs/PoseStamped` | SLAM odometry, including position and quaternion orientation |
-| `/map` | `sensor_msgs/PointCloud2` | Fully accumulated FAST-LIO map |
-| `/cloud_registered` | `sensor_msgs/PointCloud2` | Current registered frame cloud |
-| `/path` | `geometry_msgs/PoseArray` | Motion trajectory |
-| `/tf` | `tf2_msgs/TFMessage` | Coordinate transform from `base_link` to `map` |
 
 ---
 
