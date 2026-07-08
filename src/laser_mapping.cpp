@@ -1491,8 +1491,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             chrono::duration_cast<chrono::milliseconds>(
                 publish_wall_now - last_foxglove_map_pub).count() >=
                 FOXGLOVE_MAP_INTERVAL_MS;
-        if ((publish_foxglove_map || write_bag_output) &&
-            frame_id % map_publish_interval == 0)
+        const bool publish_bag_map =
+            write_bag_output && frame_id % map_publish_interval == 0;
+        if (publish_foxglove_map || publish_bag_map)
         {
             PointCloudXYZI map_cloud;
             if (publish_full_map) {
@@ -1509,7 +1510,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 map_cloud.height = 1;
                 map_cloud.is_dense = true;
 
-                if (write_bag_output) {
+                if (publish_bag_map) {
                     bag_writer->writePointCloud(pub_time_ns, map_cloud, kFastLioMapFrame,
                                                 kFastLioMapTopic);
                 }
@@ -1564,7 +1565,10 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 pcl_wait_save->push_back(pt_world);
             }
 
-            if (frame_id > 0 && (frame_id % pcd_interval == 0))
+            // Positive intervals save periodically. Non-positive intervals keep
+            // accumulating and are written once during shutdown.
+            if (frame_id > 0 && pcd_interval > 0 &&
+                (frame_id % pcd_interval == 0))
             {
                 string pcd_path = outputPath("PCD/scans_" + to_string(frame_id) + ".pcd");
                 pcl::io::savePCDFileASCII(pcd_path, *pcl_wait_save);
