@@ -1491,9 +1491,8 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             chrono::duration_cast<chrono::milliseconds>(
                 publish_wall_now - last_foxglove_map_pub).count() >=
                 FOXGLOVE_MAP_INTERVAL_MS;
-        const bool publish_bag_map =
-            write_bag_output && frame_id % map_publish_interval == 0;
-        if (publish_foxglove_map || publish_bag_map)
+        if ((publish_foxglove_map || write_bag_output) &&
+            frame_id % map_publish_interval == 0)
         {
             PointCloudXYZI map_cloud;
             if (publish_full_map) {
@@ -1510,7 +1509,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 map_cloud.height = 1;
                 map_cloud.is_dense = true;
 
-                if (publish_bag_map) {
+                if (write_bag_output) {
                     bag_writer->writePointCloud(pub_time_ns, map_cloud, kFastLioMapFrame,
                                                 kFastLioMapTopic);
                 }
