@@ -23,6 +23,7 @@ struct FoxglovePublisherImpl {
     std::optional<fg::WebSocketServer> server;
     std::optional<fgm::PointCloudChannel> cloud;
     std::optional<fgm::PointCloudChannel> map;
+    std::optional<fgm::PointCloudChannel> map_delta;
     std::optional<fgm::OdometryChannel> odom;
     std::optional<fgm::PosesInFrameChannel> path;
     std::optional<fgm::FrameTransformsChannel> tf;
@@ -151,7 +152,7 @@ FoxglovePublisher::~FoxglovePublisher() {
 }
 
 bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::unique_lock<std::shared_mutex> lock(publish_mutex_);
     if (running_) {
         return true;
     }
@@ -194,12 +195,14 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
 
     auto cloud_result = fgm::PointCloudChannel::create(kFastLioRegisteredCloudTopic);
     auto map_result = fgm::PointCloudChannel::create(kFastLioMapTopic);
+    auto map_delta_result = fgm::PointCloudChannel::create(kFastLioMapDeltaTopic);
     auto odom_result = fgm::OdometryChannel::create("/odometry");
     auto path_result = fgm::PosesInFrameChannel::create("/path");
     auto tf_result = fgm::FrameTransformsChannel::create("/tf");
 
     if (!assignChannel(impl->cloud, cloud_result, kFastLioRegisteredCloudTopic) ||
         !assignChannel(impl->map, map_result, kFastLioMapTopic) ||
+        !assignChannel(impl->map_delta, map_delta_result, kFastLioMapDeltaTopic) ||
         !assignChannel(impl->odom, odom_result, "/odometry") ||
         !assignChannel(impl->path, path_result, "/path") ||
         !assignChannel(impl->tf, tf_result, "/tf")) {
@@ -223,12 +226,13 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
 void FoxglovePublisher::setPlaybackControl(uint64_t start_time_ns,
                                            uint64_t end_time_ns,
                                            PlaybackControlCallback callback) {
+    std::unique_lock<std::shared_mutex> lock(publish_mutex_);
     playback_time_range_ = std::make_pair(start_time_ns, end_time_ns);
     playback_control_callback_ = std::move(callback);
 }
 
 void FoxglovePublisher::stop() {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::unique_lock<std::shared_mutex> lock(publish_mutex_);
     running_ = false;
 
     auto* impl = getImpl(server_impl_);
@@ -238,6 +242,7 @@ void FoxglovePublisher::stop() {
 
     if (impl->cloud) impl->cloud->close();
     if (impl->map) impl->map->close();
+    if (impl->map_delta) impl->map_delta->close();
     if (impl->odom) impl->odom->close();
     if (impl->path) impl->path->close();
     if (impl->tf) impl->tf->close();
@@ -249,6 +254,7 @@ void FoxglovePublisher::stop() {
 }
 
 size_t FoxglovePublisher::getClientCount() const {
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->server || !running_) {
         return 0;
@@ -257,7 +263,7 @@ size_t FoxglovePublisher::getClientCount() const {
 }
 
 void FoxglovePublisher::publishPointCloud(const PointCloudXYZI& cloud, double timestamp) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->cloud || !running_) {
         return;
@@ -268,20 +274,43 @@ void FoxglovePublisher::publishPointCloud(const PointCloudXYZI& cloud, double ti
 }
 
 void FoxglovePublisher::publishMap(const PointCloudXYZI& map, double timestamp) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    if (!running_) {
+        return;
+    }
+
+    // Packing grows linearly with the full map. Keep that work outside the
+    // lifecycle mutex so odometry/TF publishing is not blocked by map building.
+    auto msg = makePointCloudMessage(map, timestamp);
+
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->map || !running_) {
         return;
     }
 
-    auto msg = makePointCloudMessage(map, timestamp);
     impl->map->log(msg, doubleToNs(timestamp));
+}
+
+void FoxglovePublisher::publishMapDelta(const PointCloudXYZI& delta, double timestamp) {
+    if (!running_) {
+        return;
+    }
+
+    auto msg = makePointCloudMessage(delta, timestamp);
+
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
+    auto* impl = getImpl(server_impl_);
+    if (!impl || !impl->map_delta || !running_) {
+        return;
+    }
+
+    impl->map_delta->log(msg, doubleToNs(timestamp));
 }
 
 void FoxglovePublisher::publishOdometry(const V3D& position,
                                         const Eigen::Quaterniond& orientation,
                                         double timestamp) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->odom || !running_) {
         return;
@@ -301,7 +330,7 @@ void FoxglovePublisher::publishPath(const std::vector<V3D>& path) {
 }
 
 void FoxglovePublisher::publishPath(const std::vector<V3D>& path, double timestamp) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->path || !running_) {
         return;
@@ -326,7 +355,7 @@ void FoxglovePublisher::publishTransform(const V3D& translation,
                                          const std::string& parent_frame,
                                          const std::string& child_frame,
                                          double timestamp) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->tf || !running_) {
         return;
@@ -346,7 +375,7 @@ void FoxglovePublisher::publishTransform(const V3D& translation,
 }
 
 void FoxglovePublisher::broadcastTime(double timestamp) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->server || !running_) {
         return;
@@ -355,7 +384,7 @@ void FoxglovePublisher::broadcastTime(double timestamp) {
 }
 
 void FoxglovePublisher::broadcastPlaybackState(const PlaybackState& state) {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->server || !running_) {
         return;
@@ -364,7 +393,7 @@ void FoxglovePublisher::broadcastPlaybackState(const PlaybackState& state) {
 }
 
 void FoxglovePublisher::clearSession() {
-    std::lock_guard<std::mutex> lock(publish_mutex_);
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
     auto* impl = getImpl(server_impl_);
     if (!impl || !impl->server || !running_) {
         return;

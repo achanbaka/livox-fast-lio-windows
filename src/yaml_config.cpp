@@ -31,10 +31,16 @@ YamlConfig::YamlConfig()
     config_.dense_publish_en = true;
     config_.scan_bodyframe_pub_en = true;
     config_.publish_full_map = true;
+    config_.async_full_map_publish = true;
+    config_.full_map_publish_interval_ms = 1000;
+    config_.bag_full_map_periodic = false;
+    config_.publish_map_delta = false;
+    config_.map_delta_max_pending_points = 200000;
     config_.pcd_save_en = true;
     config_.pcd_interval = -1;
     config_.max_iteration = 3;
     config_.max_feature_points = 2000;
+    config_.iekf_match_threads = 4;
     config_.filter_size_map_min = 0.5;
     config_.filter_size_surf_min = 0.5;
     config_.cube_side_length = 1000;
@@ -84,6 +90,7 @@ bool YamlConfig::load(const std::string& filepath)
             if (map["det_range"]) config_.det_range = map["det_range"].as<double>();
             if (map["max_iteration"]) config_.max_iteration = map["max_iteration"].as<int>();
             if (map["max_feature_points"]) config_.max_feature_points = map["max_feature_points"].as<int>();
+            if (map["iekf_match_threads"]) config_.iekf_match_threads = map["iekf_match_threads"].as<int>();
             if (map["filter_size_surf"]) config_.filter_size_surf_min = map["filter_size_surf"].as<double>();
             if (map["filter_size_map"]) config_.filter_size_map_min = map["filter_size_map"].as<double>();
             if (map["cube_side_length"]) config_.cube_side_length = map["cube_side_length"].as<int>();
@@ -124,6 +131,11 @@ bool YamlConfig::load(const std::string& filepath)
             if (pub["scan_bodyframe_pub_en"]) config_.scan_bodyframe_pub_en = pub["scan_bodyframe_pub_en"].as<bool>();
             if (pub["publish_full_map"]) config_.publish_full_map = pub["publish_full_map"].as<bool>();
             if (pub["full_map_publish_en"]) config_.publish_full_map = pub["full_map_publish_en"].as<bool>();
+            if (pub["async_full_map_publish"]) config_.async_full_map_publish = pub["async_full_map_publish"].as<bool>();
+            if (pub["full_map_publish_interval_ms"]) config_.full_map_publish_interval_ms = pub["full_map_publish_interval_ms"].as<int>();
+            if (pub["bag_full_map_periodic"]) config_.bag_full_map_periodic = pub["bag_full_map_periodic"].as<bool>();
+            if (pub["publish_map_delta"]) config_.publish_map_delta = pub["publish_map_delta"].as<bool>();
+            if (pub["map_delta_max_pending_points"]) config_.map_delta_max_pending_points = pub["map_delta_max_pending_points"].as<int>();
         }
 
         // PCD save section
@@ -171,7 +183,13 @@ void YamlConfig::applyOverrides(int argc, char* argv[])
             else if (key == "filter_size_map") config_.filter_size_map_min = std::stod(val);
             else if (key == "max_iter") config_.max_iteration = std::stoi(val);
             else if (key == "max_feature_points") config_.max_feature_points = std::stoi(val);
+            else if (key == "iekf_match_threads") config_.iekf_match_threads = std::stoi(val);
             else if (key == "publish_full_map") config_.publish_full_map = (val == "true" || val == "1");
+            else if (key == "async_full_map_publish") config_.async_full_map_publish = (val == "true" || val == "1");
+            else if (key == "full_map_publish_interval_ms") config_.full_map_publish_interval_ms = std::stoi(val);
+            else if (key == "bag_full_map_periodic") config_.bag_full_map_periodic = (val == "true" || val == "1");
+            else if (key == "publish_map_delta") config_.publish_map_delta = (val == "true" || val == "1");
+            else if (key == "map_delta_max_pending_points") config_.map_delta_max_pending_points = std::stoi(val);
             else if (key == "root_dir") config_.root_dir = val;
             else if (key == "livox_broadcast_code") config_.livox_broadcast_code = val;
             else if (key == "realtime_frame_sec") config_.realtime_frame_sec = std::stod(val);

@@ -41,6 +41,11 @@ struct FastLioConfig
     bool dense_publish_en;
     bool scan_bodyframe_pub_en;
     bool publish_full_map;
+    bool async_full_map_publish;
+    int full_map_publish_interval_ms;
+    bool bag_full_map_periodic;
+    bool publish_map_delta;
+    int map_delta_max_pending_points;
 
     // PCD save
     bool pcd_save_en;
@@ -49,6 +54,7 @@ struct FastLioConfig
     // Runtime
     int max_iteration;
     int max_feature_points;
+    int iekf_match_threads;
     double filter_size_map_min;
     double filter_size_surf_min;
     int cube_side_length;

@@ -21,6 +21,7 @@ mapping:
     b_gyr_cov: 0.0001
     max_iteration: 4
     max_feature_points: 4000
+    iekf_match_threads: 4       # best total pipeline throughput on tested 8C/16T CPU
     filter_size_surf: 0.2       # current-frame voxel leaf size, meters
     filter_size_map: 0.2        # ikd-Tree/map voxel leaf size, meters
     cube_side_length: 1000
@@ -38,6 +39,11 @@ publish:
     dense_publish_en: true
     scan_bodyframe_pub_en: true
     publish_full_map: true
+    async_full_map_publish: true
+    full_map_publish_interval_ms: 1000
+    bag_full_map_periodic: false
+    publish_map_delta: false
+    map_delta_max_pending_points: 200000
 
 pcd_save:
     pcd_save_en: true

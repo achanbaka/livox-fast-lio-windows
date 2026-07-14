@@ -1,13 +1,16 @@
 #include <cassert>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <vector>
 #include <string>
 
+#include "async_map_publisher.h"
 #include "foxglove_publisher.h"
 #include "fast_lio_observation.h"
 #include "lidar_imu_sync.h"
@@ -400,6 +403,207 @@ static int testMapAccumulatorKeepsDistantFrames() {
     return 0;
 }
 
+static int testMapAccumulatorReturnsOnlyNewVoxels() {
+    MapAccumulator accumulator;
+    accumulator.setLeafSize(1.0f);
+
+    PointCloudXYZI first;
+    first.push_back(makeTestPoint(0.1f, 0.1f, 0.1f));
+    first.push_back(makeTestPoint(0.2f, 0.2f, 0.2f));
+    first.push_back(makeTestPoint(1.1f, 0.1f, 0.1f));
+    PointCloudXYZI first_delta;
+    accumulator.addFrame(first, &first_delta);
+    if (expect(first_delta.size() == 2)) return 1;
+
+    PointCloudXYZI second;
+    second.push_back(makeTestPoint(0.3f, 0.3f, 0.3f));
+    second.push_back(makeTestPoint(2.1f, 0.1f, 0.1f));
+    PointCloudXYZI second_delta;
+    accumulator.addFrame(second, &second_delta);
+    if (expect(second_delta.size() == 1)) return 1;
+    if (expect(near(second_delta.front().x, 2.1f))) return 1;
+    if (expect(accumulator.size() == 3)) return 1;
+    return 0;
+}
+
+static int testAsyncMapPublisherBuildsLatestSnapshot() {
+    MapAccumulator accumulator;
+    accumulator.setLeafSize(0.1f);
+
+    PointCloudXYZI first_cloud;
+    first_cloud.push_back(makeTestPoint(0.0f, 0.0f, 0.0f));
+
+    std::mutex result_mutex;
+    std::vector<size_t> published_sizes;
+    std::vector<double> published_timestamps;
+    std::vector<size_t> delta_sizes;
+    AsyncMapPublisher publisher(
+        accumulator,
+        [&](const PointCloudXYZI& map, double timestamp) {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            published_sizes.push_back(map.size());
+            published_timestamps.push_back(timestamp);
+        },
+        [&](const PointCloudXYZI& delta, double) {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            delta_sizes.push_back(delta.size());
+        },
+        100);
+
+    publisher.start();
+    publisher.enqueueFrame(std::move(first_cloud), 0.9);
+    publisher.request(1.0);
+    publisher.flush();
+
+    PointCloudXYZI second_cloud;
+    second_cloud.push_back(makeTestPoint(100.0f, 0.0f, 0.0f));
+    publisher.enqueueFrame(std::move(second_cloud), 1.9);
+    publisher.request(2.0);
+    publisher.flush();
+
+    PointCloudXYZI delta;
+    delta.push_back(makeTestPoint(101.0f, 0.0f, 0.0f));
+    delta.push_back(makeTestPoint(102.0f, 0.0f, 0.0f));
+    publisher.enqueueDelta(std::move(delta), 2.1);
+    publisher.flush();
+    const AsyncMapPublisher::Stats stats = publisher.stats();
+    publisher.stop();
+
+    std::lock_guard<std::mutex> lock(result_mutex);
+    if (expect(published_sizes.size() == 2)) return 1;
+    if (expect(published_sizes[0] == 1)) return 1;
+    if (expect(published_sizes[1] == 2)) return 1;
+    if (expect(published_timestamps[1] == 2.0)) return 1;
+    if (expect(stats.requested == 2)) return 1;
+    if (expect(stats.published == 2)) return 1;
+    if (expect(stats.frames_enqueued == 2)) return 1;
+    if (expect(stats.frames_built == 2)) return 1;
+    if (expect(stats.frames_dropped == 0)) return 1;
+    if (expect(delta_sizes.size() == 3)) return 1;
+    if (expect(delta_sizes[0] == 1)) return 1;
+    if (expect(delta_sizes[1] == 1)) return 1;
+    if (expect(delta_sizes[2] == 2)) return 1;
+    if (expect(stats.delta_requested == 3)) return 1;
+    if (expect(stats.delta_published == 3)) return 1;
+    if (expect(stats.failures == 0)) return 1;
+    return 0;
+}
+
+static int testAsyncMapPublisherResyncsAfterDeltaOverflow() {
+    MapAccumulator accumulator;
+    PointCloudXYZI map_cloud;
+    map_cloud.push_back(makeTestPoint(0.0f, 0.0f, 0.0f));
+    accumulator.addFrame(map_cloud);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool first_full_started = false;
+    bool release_first_full = false;
+    size_t published_delta_size = 0;
+
+    AsyncMapPublisher publisher(
+        accumulator,
+        [&](const PointCloudXYZI&, double) {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            if (!first_full_started) {
+                first_full_started = true;
+                gate_cv.notify_all();
+                gate_cv.wait(lock, [&] { return release_first_full; });
+            }
+        },
+        [&](const PointCloudXYZI& delta, double) {
+            published_delta_size = delta.size();
+        },
+        2);
+
+    publisher.start();
+    publisher.request(1.0);
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait(lock, [&] { return first_full_started; });
+    }
+
+    PointCloudXYZI first_delta;
+    first_delta.push_back(makeTestPoint(1.0f, 0.0f, 0.0f));
+    first_delta.push_back(makeTestPoint(2.0f, 0.0f, 0.0f));
+    publisher.enqueueDelta(std::move(first_delta), 1.1);
+
+    PointCloudXYZI second_delta;
+    second_delta.push_back(makeTestPoint(3.0f, 0.0f, 0.0f));
+    second_delta.push_back(makeTestPoint(4.0f, 0.0f, 0.0f));
+    publisher.enqueueDelta(std::move(second_delta), 1.2);
+
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        release_first_full = true;
+    }
+    gate_cv.notify_all();
+    publisher.flush();
+    const AsyncMapPublisher::Stats stats = publisher.stats();
+    publisher.stop();
+
+    if (expect(stats.delta_dropped_points == 2)) return 1;
+    if (expect(stats.delta_resync_requests == 1)) return 1;
+    if (expect(stats.published == 2)) return 1;
+    if (expect(stats.delta_published == 1)) return 1;
+    if (expect(published_delta_size == 2)) return 1;
+    return 0;
+}
+
+static int testAsyncMapPublisherBoundsFrameQueue() {
+    MapAccumulator accumulator;
+    accumulator.setLeafSize(0.1f);
+    PointCloudXYZI initial_map;
+    initial_map.push_back(makeTestPoint(-10.0f, 0.0f, 0.0f));
+    accumulator.addFrame(initial_map);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool snapshot_started = false;
+    bool release_snapshot = false;
+
+    AsyncMapPublisher publisher(
+        accumulator,
+        [&](const PointCloudXYZI&, double) {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            snapshot_started = true;
+            gate_cv.notify_all();
+            gate_cv.wait(lock, [&] { return release_snapshot; });
+        },
+        AsyncMapPublisher::PublishCallback{},
+        100,
+        2);
+
+    publisher.start();
+    publisher.request(1.0);
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait(lock, [&] { return snapshot_started; });
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        PointCloudXYZI frame;
+        frame.push_back(makeTestPoint(static_cast<float>(i), 0.0f, 0.0f));
+        publisher.enqueueFrame(std::move(frame), 1.1 + i * 0.1);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        release_snapshot = true;
+    }
+    gate_cv.notify_all();
+    publisher.flush();
+    const AsyncMapPublisher::Stats stats = publisher.stats();
+    publisher.stop();
+
+    if (expect(stats.frames_enqueued == 3)) return 1;
+    if (expect(stats.frames_built == 2)) return 1;
+    if (expect(stats.frames_dropped == 1)) return 1;
+    if (expect(stats.max_frame_queue_depth == 2)) return 1;
+    if (expect(accumulator.size() == 3)) return 1;
+    return 0;
+}
+
 int main() {
     if (testLivoxSdkStubMatchesOfficialLayout()) return 1;
 
@@ -426,14 +630,21 @@ int main() {
     if (expect(std::string(kFastLioBodyFrame) == "base_link")) return 1;
     if (expect(std::string(kFastLioRegisteredCloudTopic) == "/cloud_registered")) return 1;
     if (expect(std::string(kFastLioMapTopic) == "/map")) return 1;
+    if (expect(std::string(kFastLioMapDeltaTopic) == "/map_delta")) return 1;
 
     YamlConfig config;
     if (expect(config.getConfig().point_filter_num == 3)) return 1;
     if (expect(config.getConfig().max_iteration == 3)) return 1;
     if (expect(config.getConfig().max_feature_points == 2000)) return 1;
+    if (expect(config.getConfig().iekf_match_threads == 4)) return 1;
     if (expect(config.getConfig().cube_side_length == 1000)) return 1;
     if (expect(config.getConfig().runtime_pos_log == false)) return 1;
     if (expect(config.getConfig().publish_full_map == true)) return 1;
+    if (expect(config.getConfig().async_full_map_publish == true)) return 1;
+    if (expect(config.getConfig().full_map_publish_interval_ms == 1000)) return 1;
+    if (expect(config.getConfig().bag_full_map_periodic == false)) return 1;
+    if (expect(config.getConfig().publish_map_delta == false)) return 1;
+    if (expect(config.getConfig().map_delta_max_pending_points == 200000)) return 1;
 
     if (expect(!hasImuCoverageForLidarFrame(10.04, 10.05))) return 1;
     if (expect(hasImuCoverageForLidarFrame(10.05, 10.05))) return 1;
@@ -448,5 +659,9 @@ int main() {
     if (testLvxParsesImuAndDiagnostics()) return 1;
     if (testLvxOpenIgnoresEmptyTailFrame()) return 1;
     if (testMapAccumulatorKeepsDistantFrames()) return 1;
+    if (testMapAccumulatorReturnsOnlyNewVoxels()) return 1;
+    if (testAsyncMapPublisherBuildsLatestSnapshot()) return 1;
+    if (testAsyncMapPublisherResyncsAfterDeltaOverflow()) return 1;
+    if (testAsyncMapPublisherBoundsFrameQueue()) return 1;
     return 0;
 }

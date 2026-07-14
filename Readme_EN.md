@@ -254,6 +254,7 @@ Real-time WebSocket topics:
 | Topic | Foxglove schema | Description |
 |-------|-----------------|-------------|
 | `/map` | `foxglove.PointCloud` | Fully accumulated FAST-LIO map, with frame `map`; by default it does not delete historical regions when the local ikd-Tree is pruned |
+| `/map_delta` | `foxglove.PointCloud` | Optional incremental map containing only newly accepted global voxels; `/map` remains authoritative |
 | `/cloud_registered` | `foxglove.PointCloud` | Current registered frame cloud, with frame `map` |
 | `/odometry` | `foxglove.Odometry` | SLAM odometry, with body frame `base_link` |
 | `/path` | `foxglove.PosesInFrame` | Motion trajectory |
@@ -299,6 +300,7 @@ High-density configuration: [`config/horizon_hd.yaml`](config/horizon_hd.yaml). 
 | `b_gyr_cov` | double | `0.0001` | Gyroscope bias covariance |
 | `max_iteration` | int | `3` | Maximum IEKF iterations, aligned with ROS FAST-LIO Horizon launch parameters |
 | `max_feature_points` | int | `2000` | Maximum number of downsampled feature points per frame entering IEKF. `<=0` means unlimited |
+| `iekf_match_threads` | int | `4` | IEKF point-matching workers. `0` uses half the logical CPUs (capped at 8); use `1` for troubleshooting |
 | `filter_size_surf` | double | `0.5` | Voxel downsampling leaf size for the current frame cloud, in meters |
 | `filter_size_map` | double | `0.5` | Incremental downsampling leaf size for the ikd-Tree map, in meters |
 | `cube_side_length` | int | `1000` | Local map cube side length, in meters |
@@ -317,6 +319,11 @@ High-density configuration: [`config/horizon_hd.yaml`](config/horizon_hd.yaml). 
 | `dense_publish_en` | bool | `true` | Whether to publish dense point clouds. `false` enables downsampling |
 | `scan_bodyframe_pub_en` | bool | `true` | Whether to publish point clouds in the IMU body frame |
 | `publish_full_map` | bool | `true` | Whether `/map` publishes the fully accumulated map. When false, it falls back to the local ikd-Tree map |
+| `async_full_map_publish` | bool | `true` | Accumulates map frames, builds snapshots, and publishes them to Foxglove off the SLAM thread |
+| `full_map_publish_interval_ms` | int | `1000` | Minimum interval between full-map snapshots in milliseconds (minimum 100) |
+| `bag_full_map_periodic` | bool | `false` | Periodically writes full `/map` messages to the output bag; false writes only the final map |
+| `publish_map_delta` | bool | `false` | Publishes experimental `/map_delta` messages containing newly accepted global voxels |
+| `map_delta_max_pending_points` | int | `200000` | Maximum queued delta points; overflow drops stale deltas and requests a full-map resync |
 
 ### pcd_save — Point Cloud Saving
 

@@ -22,6 +22,7 @@ mapping:
     b_gyr_cov: 0.0001
     max_iteration: 3
     max_feature_points: 2000
+    iekf_match_threads: 4       # parallel nearest-neighbor matching threads
     filter_size_surf: 0.5
     filter_size_map: 0.5
     cube_side_length: 1000
@@ -39,6 +40,11 @@ publish:
     dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
     publish_full_map: true       # true: /map keeps the full replay map for Foxglove and output bag
+    async_full_map_publish: true # build and publish full-map snapshots outside the SLAM thread
+    full_map_publish_interval_ms: 1000
+    bag_full_map_periodic: false # false: write one final /map message when the run ends
+    publish_map_delta: false     # experimental: publish newly accepted map voxels on /map_delta
+    map_delta_max_pending_points: 200000
 
 pcd_save:
     pcd_save_en: true

@@ -119,6 +119,7 @@ add_definitions(-DROOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/")
 # ─── Source files ───────────────────────────────────────────────────
 set(FAST_LIO_SOURCES
     src/main.cpp
+    src/async_map_publisher.cpp
     src/laser_mapping.cpp
     src/preprocess.cpp
     src/livox_adapter.cpp
@@ -188,6 +189,7 @@ enable_testing()
 
 add_executable(livox_fast_lio_tests
     tests/test_livox_fast_lio.cpp
+    src/async_map_publisher.cpp
     src/lvx_reader.cpp
     src/yaml_config.cpp
 )

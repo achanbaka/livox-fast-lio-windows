@@ -5,6 +5,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <vector>
 #include "types.h"
@@ -13,6 +14,7 @@ constexpr const char* kFastLioMapFrame = "map";
 constexpr const char* kFastLioBodyFrame = "base_link";
 constexpr const char* kFastLioRegisteredCloudTopic = "/cloud_registered";
 constexpr const char* kFastLioMapTopic = "/map";
+constexpr const char* kFastLioMapDeltaTopic = "/map_delta";
 
 class FoxglovePublisher
 {
@@ -57,6 +59,7 @@ public:
     // Publish functions (thread-safe, can be called from any thread)
     void publishPointCloud(const PointCloudXYZI& cloud, double timestamp);
     void publishMap(const PointCloudXYZI& map, double timestamp);
+    void publishMapDelta(const PointCloudXYZI& delta, double timestamp);
     void publishOdometry(const V3D& position, const Eigen::Quaterniond& orientation, double timestamp);
     void publishPath(const std::vector<V3D>& path);
     void publishPath(const std::vector<V3D>& path, double timestamp);
@@ -79,7 +82,7 @@ private:
 
     // Server pointer (opaque to avoid including Foxglove SDK headers here)
     void* server_impl_;
-    mutable std::mutex publish_mutex_;
+    mutable std::shared_mutex publish_mutex_;
 };
 
 #endif

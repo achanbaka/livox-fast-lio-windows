@@ -139,6 +139,17 @@ public:
             return;
         }
 
+        void reserve(int requested_capacity)
+        {
+            if (requested_capacity <= cap)
+                return;
+            PointType_CMP *new_heap = new PointType_CMP[requested_capacity];
+            delete[] heap;
+            heap = new_heap;
+            cap = requested_capacity;
+            heap_size = 0;
+        }
+
     private:
         PointType_CMP *heap;
 
