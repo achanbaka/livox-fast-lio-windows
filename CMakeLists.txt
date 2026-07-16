@@ -190,6 +190,7 @@ enable_testing()
 add_executable(livox_fast_lio_tests
     tests/test_livox_fast_lio.cpp
     src/async_map_publisher.cpp
+    src/foxglove_publisher.cpp
     src/lvx_reader.cpp
     src/yaml_config.cpp
 )

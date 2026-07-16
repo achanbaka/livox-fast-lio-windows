@@ -43,9 +43,12 @@ struct FastLioConfig
     bool publish_full_map;
     bool async_full_map_publish;
     int full_map_publish_interval_ms;
+    double full_map_voxel_size;
     bool bag_full_map_periodic;
     bool publish_map_delta;
     int map_delta_max_pending_points;
+    int foxglove_control_interval_ms;
+    int foxglove_backlog_size;
 
     // PCD save
     bool pcd_save_en;

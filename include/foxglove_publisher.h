@@ -15,6 +15,8 @@ constexpr const char* kFastLioBodyFrame = "base_link";
 constexpr const char* kFastLioRegisteredCloudTopic = "/cloud_registered";
 constexpr const char* kFastLioMapTopic = "/map";
 constexpr const char* kFastLioMapDeltaTopic = "/map_delta";
+constexpr const char* kFastLioImuTopic = "/imu";
+constexpr const char* kFastLioImuFrame = "livox_imu";
 
 class FoxglovePublisher
 {
@@ -50,7 +52,8 @@ public:
     FoxglovePublisher();
     ~FoxglovePublisher();
 
-    bool start(const std::string& host = "127.0.0.1", uint16_t port = 8765);
+    bool start(const std::string& host = "127.0.0.1", uint16_t port = 8765,
+               size_t message_backlog_size = 64);
     void setPlaybackControl(uint64_t start_time_ns, uint64_t end_time_ns,
                             PlaybackControlCallback callback);
     void stop();
@@ -60,6 +63,7 @@ public:
     void publishPointCloud(const PointCloudXYZI& cloud, double timestamp);
     void publishMap(const PointCloudXYZI& map, double timestamp);
     void publishMapDelta(const PointCloudXYZI& delta, double timestamp);
+    void publishImu(const ImuData& imu);
     void publishOdometry(const V3D& position, const Eigen::Quaterniond& orientation, double timestamp);
     void publishPath(const std::vector<V3D>& path);
     void publishPath(const std::vector<V3D>& path, double timestamp);
@@ -71,12 +75,16 @@ public:
 
     uint16_t getPort() const { return port_; }
     size_t getClientCount() const;
+    uint64_t getClientConnectionGeneration() const {
+        return client_connection_generation_.load();
+    }
 
 private:
     std::atomic<bool> running_{false};
     std::string host_;
     uint16_t port_;
     std::atomic<size_t> client_count_{0};
+    std::atomic<uint64_t> client_connection_generation_{0};
     std::optional<std::pair<uint64_t, uint64_t>> playback_time_range_;
     PlaybackControlCallback playback_control_callback_;
 

@@ -2,12 +2,14 @@
 #include "ros_message.h"
 
 #include <foxglove/messages.hpp>
+#include <foxglove/channel.hpp>
 #include <foxglove/websocket.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -24,6 +26,7 @@ struct FoxglovePublisherImpl {
     std::optional<fgm::PointCloudChannel> cloud;
     std::optional<fgm::PointCloudChannel> map;
     std::optional<fgm::PointCloudChannel> map_delta;
+    std::optional<fg::RawChannel> imu;
     std::optional<fgm::OdometryChannel> odom;
     std::optional<fgm::PosesInFrameChannel> path;
     std::optional<fgm::FrameTransformsChannel> tf;
@@ -41,6 +44,36 @@ struct PackedPoint {
 };
 
 static_assert(sizeof(PackedPoint) == 20, "Foxglove point stride must stay stable");
+
+constexpr char kImuJsonSchema[] = R"json({
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "timestamp": {
+      "type": "object",
+      "properties": {
+        "sec": { "type": "integer" },
+        "nsec": { "type": "integer" }
+      },
+      "required": ["sec", "nsec"]
+    },
+    "frame_id": { "type": "string" },
+    "angular_velocity": { "$ref": "#/$defs/vector3" },
+    "linear_acceleration": { "$ref": "#/$defs/vector3" }
+  },
+  "required": ["timestamp", "frame_id", "angular_velocity", "linear_acceleration"],
+  "$defs": {
+    "vector3": {
+      "type": "object",
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" }
+      },
+      "required": ["x", "y", "z"]
+    }
+  }
+})json";
 
 fgm::Timestamp toFoxgloveTimestamp(double timestamp) {
     uint32_t sec = 0;
@@ -151,7 +184,8 @@ FoxglovePublisher::~FoxglovePublisher() {
     stop();
 }
 
-bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
+bool FoxglovePublisher::start(const std::string& host, uint16_t port,
+                              size_t message_backlog_size) {
     std::unique_lock<std::shared_mutex> lock(publish_mutex_);
     if (running_) {
         return true;
@@ -164,7 +198,25 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
     options.host = host;
     options.port = port;
     options.capabilities = fg::WebSocketServerCapabilities::Time;
-    options.message_backlog_size = 8;
+    // Data and control messages share the configured queue depth. A backlog of
+    // eight is too small when a client is decoding a large point cloud: the
+    // control queue can fill and the SDK then disconnects the slow client.
+    options.message_backlog_size = std::max<size_t>(message_backlog_size, 8);
+    client_count_ = 0;
+    client_connection_generation_ = 0;
+    options.callbacks.onClientConnect = [this]() {
+        const size_t count = client_count_.fetch_add(1) + 1;
+        client_connection_generation_.fetch_add(1);
+        std::cout << "[Foxglove] Client connected (clients=" << count << ")"
+                  << std::endl;
+    };
+    options.callbacks.onClientDisconnect = [this]() {
+        size_t current = client_count_.load();
+        while (current > 0 &&
+               !client_count_.compare_exchange_weak(current, current - 1)) {}
+        std::cout << "[Foxglove] Client disconnected (clients="
+                  << client_count_.load() << ")" << std::endl;
+    };
     if (playback_time_range_ && playback_control_callback_) {
         options.playback_time_range = playback_time_range_;
         options.capabilities =
@@ -183,7 +235,7 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
                 return toSdkPlaybackState(playback_control_callback_(request));
             };
     }
-    options.supported_encodings = {"protobuf"};
+    options.supported_encodings = {"protobuf", "json"};
 
     auto server_result = fg::WebSocketServer::create(std::move(options));
     if (!server_result) {
@@ -196,6 +248,14 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
     auto cloud_result = fgm::PointCloudChannel::create(kFastLioRegisteredCloudTopic);
     auto map_result = fgm::PointCloudChannel::create(kFastLioMapTopic);
     auto map_delta_result = fgm::PointCloudChannel::create(kFastLioMapDeltaTopic);
+    const fg::Schema imu_schema{
+        "livox_fast_lio/Imu",
+        "jsonschema",
+        reinterpret_cast<const std::byte*>(kImuJsonSchema),
+        sizeof(kImuJsonSchema) - 1,
+    };
+    auto imu_result = fg::RawChannel::create(
+        kFastLioImuTopic, "json", imu_schema);
     auto odom_result = fgm::OdometryChannel::create("/odometry");
     auto path_result = fgm::PosesInFrameChannel::create("/path");
     auto tf_result = fgm::FrameTransformsChannel::create("/tf");
@@ -203,6 +263,7 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
     if (!assignChannel(impl->cloud, cloud_result, kFastLioRegisteredCloudTopic) ||
         !assignChannel(impl->map, map_result, kFastLioMapTopic) ||
         !assignChannel(impl->map_delta, map_delta_result, kFastLioMapDeltaTopic) ||
+        !assignChannel(impl->imu, imu_result, kFastLioImuTopic) ||
         !assignChannel(impl->odom, odom_result, "/odometry") ||
         !assignChannel(impl->path, path_result, "/path") ||
         !assignChannel(impl->tf, tf_result, "/tf")) {
@@ -214,7 +275,6 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port) {
 
     host_ = host;
     port_ = impl->server->port();
-    client_count_ = 0;
     server_impl_ = impl.release();
     running_ = true;
 
@@ -243,6 +303,7 @@ void FoxglovePublisher::stop() {
     if (impl->cloud) impl->cloud->close();
     if (impl->map) impl->map->close();
     if (impl->map_delta) impl->map_delta->close();
+    if (impl->imu) impl->imu->close();
     if (impl->odom) impl->odom->close();
     if (impl->path) impl->path->close();
     if (impl->tf) impl->tf->close();
@@ -305,6 +366,36 @@ void FoxglovePublisher::publishMapDelta(const PointCloudXYZI& delta, double time
     }
 
     impl->map_delta->log(msg, doubleToNs(timestamp));
+}
+
+void FoxglovePublisher::publishImu(const ImuData& imu) {
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
+    auto* impl = getImpl(server_impl_);
+    if (!impl || !impl->imu || !running_) {
+        return;
+    }
+
+    uint32_t sec = 0;
+    uint32_t nsec = 0;
+    doubleToRosTime(imu.timestamp, sec, nsec);
+
+    // Fixed-size formatting avoids heap churn on the 200 Hz sensor callback.
+    char json[512];
+    const int length = std::snprintf(
+        json, sizeof(json),
+        "{\"timestamp\":{\"sec\":%u,\"nsec\":%u},"
+        "\"frame_id\":\"%s\","
+        "\"angular_velocity\":{\"x\":%.12g,\"y\":%.12g,\"z\":%.12g},"
+        "\"linear_acceleration\":{\"x\":%.12g,\"y\":%.12g,\"z\":%.12g}}",
+        sec, nsec, kFastLioImuFrame,
+        imu.gyro.x(), imu.gyro.y(), imu.gyro.z(),
+        imu.acc.x(), imu.acc.y(), imu.acc.z());
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(json)) {
+        return;
+    }
+
+    impl->imu->log(reinterpret_cast<const std::byte*>(json),
+                   static_cast<size_t>(length), doubleToNs(imu.timestamp));
 }
 
 void FoxglovePublisher::publishOdometry(const V3D& position,

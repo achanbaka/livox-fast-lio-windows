@@ -116,7 +116,10 @@ static bool   async_full_map_publish = true;
 static bool   bag_full_map_periodic  = false;
 static bool   publish_map_delta      = false;
 static int    full_map_publish_interval_ms = 1000;
+static double full_map_voxel_size    = 0.2;
 static size_t map_delta_max_pending_points = 200000;
+static int    foxglove_control_interval_ms = 20;
+static size_t foxglove_backlog_size  = 64;
 static string root_dir;
 static ofstream runtime_log;
 static constexpr int MAP_PUBLISH_INTERVAL = 1;
@@ -905,8 +908,18 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     bag_full_map_periodic  = config.bag_full_map_periodic;
     publish_map_delta      = config.publish_map_delta;
     full_map_publish_interval_ms = max(100, config.full_map_publish_interval_ms);
+    full_map_voxel_size = config.full_map_voxel_size > 0.0
+        ? max(filter_size_map_min, config.full_map_voxel_size)
+        : filter_size_map_min;
     map_delta_max_pending_points = static_cast<size_t>(
         max(1000, config.map_delta_max_pending_points));
+    // Foxglove uses broadcast time as its live playback clock. Keep it near the
+    // lidar frame rate so odometry/TF motion remains smooth; disconnect
+    // protection comes from avoiding repeated PlaybackState broadcasts and
+    // from the larger server backlog, not from reducing the clock to 4 Hz.
+    foxglove_control_interval_ms = max(10, config.foxglove_control_interval_ms);
+    foxglove_backlog_size = static_cast<size_t>(
+        max(8, config.foxglove_backlog_size));
     root_dir               = resolveOutputRoot(config.root_dir);
     replay_backpressure_enabled = use_lvx || use_bag;
     replay_backpressure_stop = false;
@@ -914,7 +927,10 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ── Initialise ikd-Tree ──────────────────────────────────────────
     ikdtree.set_downsample_param(static_cast<float>(filter_size_map_min));
     full_map_accumulator.clear();
-    full_map_accumulator.setLeafSize(static_cast<float>(filter_size_map_min));
+    // Keep the high-resolution ikd-Tree independent from the visualization
+    // accumulator. A 0.05 m global output map grows too quickly for periodic
+    // full snapshots and WebSocket delivery.
+    full_map_accumulator.setLeafSize(static_cast<float>(full_map_voxel_size));
 
     // ── Initialise preprocessor ──────────────────────────────────────
     p_pre.set(config.feature_enabled, config.lidar_type, config.blind, config.point_filter_num);
@@ -968,12 +984,18 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                         << (async_full_map_publish ? "true" : "false") << '\n'
                         << "full_map_publish_interval_ms="
                         << full_map_publish_interval_ms << '\n'
+                        << "full_map_voxel_size="
+                        << full_map_voxel_size << '\n'
                         << "bag_full_map_periodic="
                         << (bag_full_map_periodic ? "true" : "false") << '\n'
                         << "publish_map_delta="
                         << (publish_map_delta ? "true" : "false") << '\n'
                         << "map_delta_max_pending_points="
-                        << map_delta_max_pending_points << '\n';
+                        << map_delta_max_pending_points << '\n'
+                        << "foxglove_control_interval_ms="
+                        << foxglove_control_interval_ms << '\n'
+                        << "foxglove_backlog_size="
+                        << foxglove_backlog_size << '\n';
             runtime_log.flush();
         }
     }
@@ -1025,6 +1047,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     atomic<uint64_t>    playback_current_time_ns{0};
     atomic<double>      playback_speed{1.0};
     atomic<bool>        playback_paused{false};
+    atomic<bool>        playback_pause_drain_pending{false};
 
     if (use_lvx)
     {
@@ -1036,7 +1059,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         }
 
         lvx_reader->setFrameCallback(
-            [](const vector<LvxPoint> &points,
+            [&foxglove](const vector<LvxPoint> &points,
                const vector<ImuData> &imus,
                double timestamp)
             {
@@ -1045,8 +1068,10 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 if (!cloud->empty())
                     pushLidarFrame(cloud, timestamp);
 
-                for (auto &imu : imus)
+                for (auto &imu : imus) {
+                    foxglove.publishImu(imu);
                     pushImuSample(imu);
+                }
             });
 
     }
@@ -1060,7 +1085,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         }
 
         bag_reader->setFrameCallback(
-            [](const vector<LvxPoint> &points,
+            [&foxglove](const vector<LvxPoint> &points,
                const vector<ImuData> &imus,
                double timestamp)
             {
@@ -1069,8 +1094,10 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                     if (!cloud->empty())
                         pushLidarFrame(cloud, timestamp);
                 }
-                for (auto &imu : imus)
+                for (auto &imu : imus) {
+                    foxglove.publishImu(imu);
                     pushImuSample(imu);
+                }
             });
 
     }
@@ -1130,7 +1157,10 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             });
 
         livox_adapter->setImuCallback(
-            [](const ImuData &imu) { pushImuSample(imu); });
+            [&foxglove](const ImuData &imu) {
+                foxglove.publishImu(imu);
+                pushImuSample(imu);
+            });
 
     }
 
@@ -1149,10 +1179,13 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                     // Seek is temporarily disabled because Foxglove clears the rendered map on seek.
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
                     lvx_reader->pause();
-                    playback_paused = true;
+                    if (!playback_paused.exchange(true)) {
+                        playback_pause_drain_pending = true;
+                    }
                 } else {
                     lvx_reader->resume();
                     playback_paused = false;
+                    playback_pause_drain_pending = false;
                 }
 
                 return FoxglovePublisher::PlaybackState{
@@ -1176,10 +1209,13 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                     // Seek is temporarily disabled because Foxglove clears the rendered map on seek.
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
                     bag_reader->pause();
-                    playback_paused = true;
+                    if (!playback_paused.exchange(true)) {
+                        playback_pause_drain_pending = true;
+                    }
                 } else {
                     bag_reader->resume();
                     playback_paused = false;
+                    playback_pause_drain_pending = false;
                 }
 
                 return FoxglovePublisher::PlaybackState{
@@ -1191,7 +1227,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             });
     }
 
-    if (!foxglove.start("127.0.0.1", 8765))
+    if (!foxglove.start("127.0.0.1", 8765, foxglove_backlog_size))
     {
         cerr << "[LaserMapping] Failed to start Foxglove publisher." << endl;
     }
@@ -1220,7 +1256,8 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             async_map_publisher->start();
             if (async_full_map_publish) {
                 cout << "[LaserMapping] Asynchronous full-map build and publishing enabled."
-                     << endl;
+                     << " output_voxel=" << full_map_voxel_size << " m"
+                     << ", backlog=" << foxglove_backlog_size << endl;
             }
             if (publish_map_delta) {
                 cout << "[LaserMapping] Incremental map topic enabled: "
@@ -1229,14 +1266,34 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         }
     }
 
+    uint64_t last_playback_client_generation =
+        foxglove.getClientConnectionGeneration();
     if (use_lvx && lvx_reader)
     {
         lvx_reader->play(playback_speed.load());
+        if (foxglove.isRunning()) {
+            foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+                FoxglovePublisher::PlaybackStatus::Playing,
+                playback_current_time_ns.load(),
+                static_cast<float>(playback_speed.load()),
+                false});
+            last_playback_client_generation =
+                foxglove.getClientConnectionGeneration();
+        }
         cout << "[LaserMapping] LVX playback started." << endl;
     }
     else if (use_bag && bag_reader)
     {
         bag_reader->play(playback_speed.load());
+        if (foxglove.isRunning()) {
+            foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+                FoxglovePublisher::PlaybackStatus::Playing,
+                playback_current_time_ns.load(),
+                static_cast<float>(playback_speed.load()),
+                false});
+            last_playback_client_generation =
+                foxglove.getClientConnectionGeneration();
+        }
         cout << "[LaserMapping] Bag playback started." << endl;
     }
     else if (livox_adapter)
@@ -1280,6 +1337,8 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             publish_full_map ? full_map_publish_interval_ms : FOXGLOVE_MAP_INTERVAL_MS);
     auto last_foxglove_path_pub =
         foxglove_publish_start - chrono::milliseconds(FOXGLOVE_PATH_INTERVAL_MS);
+    auto last_foxglove_control_pub =
+        foxglove_publish_start - chrono::milliseconds(foxglove_control_interval_ms);
 
     // PCD accumulation cloud
     PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
@@ -1300,16 +1359,37 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ══════════════════════════════════════════════════════════════════
     while (!g_exit_flag.load())
     {
-        // Check EOF for lvx/bag — but only exit after all buffered data is processed
-        if ((use_lvx || use_bag) && playback_paused.load())
-        {
-            if (foxglove.isRunning()) {
+        // Foxglove initially renders a paused-looking play button until it
+        // receives a playback state. Re-announce only for a newly connected
+        // client, including reconnects, instead of flooding the control queue.
+        if ((use_lvx || use_bag) && foxglove.isRunning()) {
+            const uint64_t client_generation =
+                foxglove.getClientConnectionGeneration();
+            if (client_generation != last_playback_client_generation) {
+                last_playback_client_generation = client_generation;
                 foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
-                    FoxglovePublisher::PlaybackStatus::Paused,
+                    playback_paused.load()
+                        ? FoxglovePublisher::PlaybackStatus::Paused
+                        : FoxglovePublisher::PlaybackStatus::Playing,
                     playback_current_time_ns.load(),
                     static_cast<float>(playback_speed.load()),
                     false});
             }
+        }
+
+        // Check EOF for lvx/bag — but only exit after all buffered data is processed
+        if ((use_lvx || use_bag) && playback_paused.load())
+        {
+            if (playback_pause_drain_pending.exchange(false) &&
+                async_map_publisher && async_map_publisher->isRunning())
+            {
+                if (publish_full_map && foxglove.isRunning()) {
+                    async_map_publisher->request(
+                        static_cast<double>(playback_current_time_ns.load()) / 1e9);
+                }
+                async_map_publisher->flush();
+            }
+
             this_thread::sleep_for(chrono::milliseconds(20));
             continue;
         }
@@ -1549,6 +1629,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
         double map_accumulate_ms = 0.0;
         double map_schedule_ms = 0.0;
+        int effective_full_map_interval_ms = full_map_publish_interval_ms;
         if (publish_full_map) {
             const auto map_accumulate_begin = chrono::steady_clock::now();
             PointCloudXYZI map_frame_world;
@@ -1585,10 +1666,20 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
         const auto map_schedule_begin = chrono::steady_clock::now();
         if (publish_full_map) {
+            if (async_map_publisher) {
+                const auto timing_stats = async_map_publisher->stats();
+                const double last_full_output_ms =
+                    timing_stats.last_snapshot_ms + timing_stats.last_publish_ms;
+                if (last_full_output_ms > 0.0) {
+                    effective_full_map_interval_ms = max(
+                        full_map_publish_interval_ms,
+                        static_cast<int>(ceil(last_full_output_ms * 2.0)));
+                }
+            }
             const bool full_map_due =
                 chrono::duration_cast<chrono::milliseconds>(
                     publish_wall_now - last_foxglove_map_pub).count() >=
-                full_map_publish_interval_ms;
+                effective_full_map_interval_ms;
             const bool async_foxglove_map =
                 publish_foxglove && async_full_map_publish && async_map_publisher &&
                 async_map_publisher->isRunning();
@@ -1668,16 +1759,14 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             }
         }
 
-        if (publish_foxglove) {
+        const bool publish_foxglove_control =
+            publish_foxglove &&
+            chrono::duration_cast<chrono::milliseconds>(
+                publish_wall_now - last_foxglove_control_pub).count() >=
+                foxglove_control_interval_ms;
+        if (publish_foxglove_control) {
             foxglove.broadcastTime(pub_time);
-            if (use_lvx || use_bag) {
-                foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
-                    playback_paused ? FoxglovePublisher::PlaybackStatus::Paused
-                                    : FoxglovePublisher::PlaybackStatus::Playing,
-                    pub_time_ns,
-                    static_cast<float>(playback_speed.load()),
-                    false});
-            }
+            last_foxglove_control_pub = publish_wall_now;
         }
 
         T2 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
@@ -1743,15 +1832,18 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                  << " publish_ms=" << s_plot6
                  << " map_accumulate_ms=" << map_accumulate_ms
                  << " map_schedule_ms=" << map_schedule_ms
+                 << " map_effective_interval_ms=" << effective_full_map_interval_ms
                  << " map_async_requested=" << async_map_stats.requested
                  << " map_async_published=" << async_map_stats.published
                  << " map_async_coalesced=" << async_map_stats.coalesced
                  << " map_async_snapshot_ms=" << async_map_stats.last_snapshot_ms
                  << " map_async_send_ms=" << async_map_stats.last_publish_ms
                  << " map_async_points=" << async_map_stats.last_point_count
+                 << " map_accumulator_points=" << full_map_accumulator.size()
                  << " map_frames_enqueued=" << async_map_stats.frames_enqueued
                  << " map_frames_built=" << async_map_stats.frames_built
                  << " map_frames_dropped=" << async_map_stats.frames_dropped
+                 << " map_frame_queue_current=" << async_map_stats.current_frame_queue_depth
                  << " map_frame_queue_max=" << async_map_stats.max_frame_queue_depth
                  << " map_frame_points=" << async_map_stats.last_frame_point_count
                  << " map_frame_build_ms=" << async_map_stats.last_frame_build_ms
@@ -1760,8 +1852,11 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                  << " map_delta_coalesced=" << async_map_stats.delta_coalesced
                  << " map_delta_dropped_points=" << async_map_stats.delta_dropped_points
                  << " map_delta_resync_requests=" << async_map_stats.delta_resync_requests
+                 << " map_delta_queue_points=" << async_map_stats.current_delta_points
                  << " map_delta_points=" << async_map_stats.last_delta_point_count
                  << " map_delta_send_ms=" << async_map_stats.last_delta_publish_ms
+                 << " map_full_pending=" << (async_map_stats.full_map_pending ? 1 : 0)
+                 << " map_worker_busy=" << (async_map_stats.busy ? 1 : 0)
                  << " total_ms=" << loop_ms
                  << " points=" << feats_down_size
                  << " tree_size=" << ikdtree.size()

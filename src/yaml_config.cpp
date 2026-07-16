@@ -33,9 +33,12 @@ YamlConfig::YamlConfig()
     config_.publish_full_map = true;
     config_.async_full_map_publish = true;
     config_.full_map_publish_interval_ms = 1000;
+    config_.full_map_voxel_size = 0.2;
     config_.bag_full_map_periodic = false;
     config_.publish_map_delta = false;
     config_.map_delta_max_pending_points = 200000;
+    config_.foxglove_control_interval_ms = 20;
+    config_.foxglove_backlog_size = 64;
     config_.pcd_save_en = true;
     config_.pcd_interval = -1;
     config_.max_iteration = 3;
@@ -133,9 +136,12 @@ bool YamlConfig::load(const std::string& filepath)
             if (pub["full_map_publish_en"]) config_.publish_full_map = pub["full_map_publish_en"].as<bool>();
             if (pub["async_full_map_publish"]) config_.async_full_map_publish = pub["async_full_map_publish"].as<bool>();
             if (pub["full_map_publish_interval_ms"]) config_.full_map_publish_interval_ms = pub["full_map_publish_interval_ms"].as<int>();
+            if (pub["full_map_voxel_size"]) config_.full_map_voxel_size = pub["full_map_voxel_size"].as<double>();
             if (pub["bag_full_map_periodic"]) config_.bag_full_map_periodic = pub["bag_full_map_periodic"].as<bool>();
             if (pub["publish_map_delta"]) config_.publish_map_delta = pub["publish_map_delta"].as<bool>();
             if (pub["map_delta_max_pending_points"]) config_.map_delta_max_pending_points = pub["map_delta_max_pending_points"].as<int>();
+            if (pub["foxglove_control_interval_ms"]) config_.foxglove_control_interval_ms = pub["foxglove_control_interval_ms"].as<int>();
+            if (pub["foxglove_backlog_size"]) config_.foxglove_backlog_size = pub["foxglove_backlog_size"].as<int>();
         }
 
         // PCD save section
@@ -187,9 +193,12 @@ void YamlConfig::applyOverrides(int argc, char* argv[])
             else if (key == "publish_full_map") config_.publish_full_map = (val == "true" || val == "1");
             else if (key == "async_full_map_publish") config_.async_full_map_publish = (val == "true" || val == "1");
             else if (key == "full_map_publish_interval_ms") config_.full_map_publish_interval_ms = std::stoi(val);
+            else if (key == "full_map_voxel_size") config_.full_map_voxel_size = std::stod(val);
             else if (key == "bag_full_map_periodic") config_.bag_full_map_periodic = (val == "true" || val == "1");
             else if (key == "publish_map_delta") config_.publish_map_delta = (val == "true" || val == "1");
             else if (key == "map_delta_max_pending_points") config_.map_delta_max_pending_points = std::stoi(val);
+            else if (key == "foxglove_control_interval_ms") config_.foxglove_control_interval_ms = std::stoi(val);
+            else if (key == "foxglove_backlog_size") config_.foxglove_backlog_size = std::stoi(val);
             else if (key == "root_dir") config_.root_dir = val;
             else if (key == "livox_broadcast_code") config_.livox_broadcast_code = val;
             else if (key == "realtime_frame_sec") config_.realtime_frame_sec = std::stod(val);

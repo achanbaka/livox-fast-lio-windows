@@ -39,9 +39,12 @@ publish:
     publish_full_map: true       # true: /map keeps the full replay map for Foxglove and output bag
     async_full_map_publish: true # build and publish full-map snapshots outside the SLAM thread
     full_map_publish_interval_ms: 1000
+    full_map_voxel_size: 0.2     # independent voxel size for full-map output
     bag_full_map_periodic: false # false: write one final /map message when the run ends
     publish_map_delta: false     # experimental: publish newly accepted map voxels on /map_delta
     map_delta_max_pending_points: 200000
+    foxglove_control_interval_ms: 20  # smooth Foxglove playback clock (up to 50 Hz)
+    foxglove_backlog_size: 64
 
 pcd_save:
     pcd_save_en: true

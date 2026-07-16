@@ -22,8 +22,10 @@ mapping:
     max_iteration: 4
     max_feature_points: 4000
     iekf_match_threads: 4       # best total pipeline throughput on tested 8C/16T CPU
-    filter_size_surf: 0.2       # current-frame voxel leaf size, meters
-    filter_size_map: 0.2        # ikd-Tree/map voxel leaf size, meters
+    # filter_size_surf: 0.2       # current-frame voxel leaf size, meters
+    # filter_size_map: 0.2        # ikd-Tree/map voxel leaf size, meters
+    filter_size_surf: 0.05       # current-frame voxel leaf size, meters
+    filter_size_map: 0.05        # ikd-Tree/map voxel leaf size, meters
     cube_side_length: 1000
     fov_degree:    100
     det_range:     260.0
@@ -41,9 +43,12 @@ publish:
     publish_full_map: true
     async_full_map_publish: true
     full_map_publish_interval_ms: 1000
+    full_map_voxel_size: 0.2    # keep visualization snapshots bounded while SLAM remains at 0.05 m
     bag_full_map_periodic: false
     publish_map_delta: false
     map_delta_max_pending_points: 200000
+    foxglove_control_interval_ms: 20  # smooth Foxglove playback clock (up to 50 Hz)
+    foxglove_backlog_size: 64
 
 pcd_save:
     pcd_save_en: true

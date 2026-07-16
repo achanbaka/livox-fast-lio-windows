@@ -109,6 +109,22 @@ static int testLivoxSdkStubMatchesOfficialLayout() {
     return 0;
 }
 
+static int testFoxglovePublishesImuJson() {
+    FoxglovePublisher publisher;
+    if (expect(publisher.start("127.0.0.1", 0, 64))) return 1;
+    if (expect(publisher.getPort() != 0)) return 1;
+
+    ImuData imu;
+    imu.timestamp = 123.005;
+    imu.gyro = V3D(0.1, -0.2, 0.3);
+    imu.acc = V3D(1.0, 2.0, 9.81);
+    publisher.publishImu(imu);
+    publisher.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+        FoxglovePublisher::PlaybackStatus::Playing, 123005000000ULL, 1.0f, false});
+    publisher.stop();
+    return 0;
+}
+
 static int testLvxParsesCartesianPackets() {
     std::vector<uint8_t> frame;
 
@@ -631,6 +647,8 @@ int main() {
     if (expect(std::string(kFastLioRegisteredCloudTopic) == "/cloud_registered")) return 1;
     if (expect(std::string(kFastLioMapTopic) == "/map")) return 1;
     if (expect(std::string(kFastLioMapDeltaTopic) == "/map_delta")) return 1;
+    if (expect(std::string(kFastLioImuTopic) == "/imu")) return 1;
+    if (expect(std::string(kFastLioImuFrame) == "livox_imu")) return 1;
 
     YamlConfig config;
     if (expect(config.getConfig().point_filter_num == 3)) return 1;
@@ -642,9 +660,12 @@ int main() {
     if (expect(config.getConfig().publish_full_map == true)) return 1;
     if (expect(config.getConfig().async_full_map_publish == true)) return 1;
     if (expect(config.getConfig().full_map_publish_interval_ms == 1000)) return 1;
+    if (expect(near(config.getConfig().full_map_voxel_size, 0.2))) return 1;
     if (expect(config.getConfig().bag_full_map_periodic == false)) return 1;
     if (expect(config.getConfig().publish_map_delta == false)) return 1;
     if (expect(config.getConfig().map_delta_max_pending_points == 200000)) return 1;
+    if (expect(config.getConfig().foxglove_control_interval_ms == 20)) return 1;
+    if (expect(config.getConfig().foxglove_backlog_size == 64)) return 1;
 
     if (expect(!hasImuCoverageForLidarFrame(10.04, 10.05))) return 1;
     if (expect(hasImuCoverageForLidarFrame(10.05, 10.05))) return 1;
@@ -655,6 +676,7 @@ int main() {
     if (expect(!fastLioPlaneResidualAccepted(1.0, 4.0))) return 1;
 
     if (testLvxParsesCartesianPackets()) return 1;
+    if (testFoxglovePublishesImuJson()) return 1;
     if (testLvxParsesSphericalPackets()) return 1;
     if (testLvxParsesImuAndDiagnostics()) return 1;
     if (testLvxOpenIgnoresEmptyTailFrame()) return 1;

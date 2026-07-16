@@ -26,6 +26,7 @@ public:
         uint64_t frames_enqueued = 0;
         uint64_t frames_built = 0;
         uint64_t frames_dropped = 0;
+        size_t current_frame_queue_depth = 0;
         size_t max_frame_queue_depth = 0;
         size_t last_frame_point_count = 0;
         double last_frame_build_ms = 0.0;
@@ -34,8 +35,11 @@ public:
         uint64_t delta_coalesced = 0;
         uint64_t delta_dropped_points = 0;
         uint64_t delta_resync_requests = 0;
+        size_t current_delta_points = 0;
         size_t last_delta_point_count = 0;
         double last_delta_publish_ms = 0.0;
+        bool full_map_pending = false;
+        bool busy = false;
     };
 
     AsyncMapPublisher(MapAccumulator& accumulator,

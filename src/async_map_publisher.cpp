@@ -194,7 +194,12 @@ bool AsyncMapPublisher::isRunning() const
 AsyncMapPublisher::Stats AsyncMapPublisher::stats() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return stats_;
+    Stats result = stats_;
+    result.current_frame_queue_depth = pending_frames_.size();
+    result.current_delta_points = pending_delta_.size();
+    result.full_map_pending = pending_;
+    result.busy = busy_;
+    return result;
 }
 
 void AsyncMapPublisher::run()
