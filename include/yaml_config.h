@@ -49,6 +49,35 @@ struct FastLioConfig
     int map_delta_max_pending_points;
     int foxglove_control_interval_ms;
     int foxglove_backlog_size;
+    double foxglove_current_cloud_publish_hz;
+    double foxglove_path_publish_hz;
+
+    // Scalable map output pipeline. Legacy publish.* fields are still loaded
+    // and are used as fallbacks when a corresponding map_output field is absent.
+    std::string map_output_mode;
+    int map_output_full_publish_interval_ms;
+    double map_output_full_voxel_leaf_m;
+    double map_output_tile_size_m;
+    double map_output_tile_voxel_leaf_m;
+    std::string map_output_voxel_update_policy;
+    int map_output_tile_publish_hz;
+    int map_output_max_tiles_per_update;
+    int map_output_max_points_per_update;
+    int map_output_input_queue_capacity;
+    int map_output_input_queue_max_mb;
+    int map_output_max_memory_mb;
+    std::string map_output_memory_policy;
+
+    // Storage pipeline policy. The worker implementation consumes these fields
+    // incrementally; keeping them in config now makes old/new files migratable.
+    std::string storage_mode;
+    int storage_queue_max_mb;
+    double storage_bag_path_publish_hz;
+    int storage_path_max_points;
+    std::string storage_pcd_format;
+    int storage_pcd_chunk_points;
+    int storage_pcd_chunk_frames;
+    bool storage_save_final_ikdtree;
 
     // PCD save
     bool pcd_save_en;
@@ -77,6 +106,7 @@ public:
 
     // Parse command line overrides
     void applyOverrides(int argc, char* argv[]);
+    bool validate(std::string& error) const;
 
 private:
     FastLioConfig config_;

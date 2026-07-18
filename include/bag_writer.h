@@ -3,6 +3,7 @@
 
 #include <string>
 #include <fstream>
+#include <functional>
 #include <vector>
 #include <map>
 #include <cstdint>
@@ -16,7 +17,9 @@
  */
 class BagWriter {
 public:
-    BagWriter();
+    using IoHook = std::function<void(const char* operation)>;
+
+    explicit BagWriter(IoHook io_hook = {});
     ~BagWriter();
 
     bool open(const std::string& filepath);
@@ -79,11 +82,13 @@ private:
     };
 
     // Write helpers
-    void writeRecordHeader(const std::vector<std::pair<std::string, std::string>>& fields,
-                           uint32_t data_len);
     void writeRaw(const void* data, size_t len);
     void writeU32(uint32_t v);
-    void writeU64(uint64_t v);
+    uint64_t tellPosition(const char* operation);
+    void seekPosition(std::streamoff offset, const char* operation);
+    void ensureStreamGood(const char* operation) const;
+    void closeFileNoThrow() noexcept;
+    void invokeIoHook(const char* operation);
 
     // Chunk management
     void flushChunk();
@@ -97,6 +102,7 @@ private:
 
     std::ofstream file_;
     std::string filepath_;
+    IoHook io_hook_;
 
     // Connections
     std::map<uint32_t, ConnectionInfo> connections_;
@@ -108,9 +114,6 @@ private:
     uint64_t chunk_start_time_ = 0;
     uint64_t chunk_end_time_ = 0;
     static const size_t CHUNK_MAX_SIZE = 10 * 1024 * 1024; // 10 MB
-
-    // Global index: conn_id → [(time_ns, offset_in_file)]
-    std::map<uint32_t, std::vector<std::pair<uint64_t, uint32_t>>> connection_index_;
 
     // Chunk records for CHUNK_INFO
     std::vector<ChunkRecord> chunk_records_;

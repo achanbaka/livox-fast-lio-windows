@@ -6,14 +6,17 @@
 #include <foxglove/websocket.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace fg = foxglove;
@@ -26,6 +29,7 @@ struct FoxglovePublisherImpl {
     std::optional<fgm::PointCloudChannel> cloud;
     std::optional<fgm::PointCloudChannel> map;
     std::optional<fgm::PointCloudChannel> map_delta;
+    std::optional<fgm::SceneUpdateChannel> map_tiles;
     std::optional<fg::RawChannel> imu;
     std::optional<fgm::OdometryChannel> odom;
     std::optional<fgm::PosesInFrameChannel> path;
@@ -180,8 +184,18 @@ FoxglovePublisher::FoxglovePublisher()
     : port_(8765), server_impl_(nullptr)
 {}
 
-FoxglovePublisher::~FoxglovePublisher() {
-    stop();
+FoxglovePublisher::~FoxglovePublisher() noexcept {
+    try {
+        stop();
+    } catch (const std::exception& error) {
+        // stop() is exception-safe and has already detached/deleted the SDK
+        // implementation before rethrowing. Destructors must never translate
+        // an SDK shutdown error into std::terminate.
+        std::cerr << "[Foxglove] stop failed during destruction: "
+                  << error.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[Foxglove] stop failed during destruction" << std::endl;
+    }
 }
 
 bool FoxglovePublisher::start(const std::string& host, uint16_t port,
@@ -189,6 +203,11 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port,
     std::unique_lock<std::shared_mutex> lock(publish_mutex_);
     if (running_) {
         return true;
+    }
+    {
+        std::lock_guard<std::mutex> timing_lock(timing_mutex_);
+        map_serialize_timing_ = BoundedTimingWindow<>{};
+        map_send_timing_ = BoundedTimingWindow<>{};
     }
 
     auto impl = std::make_unique<FoxglovePublisherImpl>();
@@ -248,6 +267,7 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port,
     auto cloud_result = fgm::PointCloudChannel::create(kFastLioRegisteredCloudTopic);
     auto map_result = fgm::PointCloudChannel::create(kFastLioMapTopic);
     auto map_delta_result = fgm::PointCloudChannel::create(kFastLioMapDeltaTopic);
+    auto map_tiles_result = fgm::SceneUpdateChannel::create(kFastLioMapTilesTopic);
     const fg::Schema imu_schema{
         "livox_fast_lio/Imu",
         "jsonschema",
@@ -263,6 +283,7 @@ bool FoxglovePublisher::start(const std::string& host, uint16_t port,
     if (!assignChannel(impl->cloud, cloud_result, kFastLioRegisteredCloudTopic) ||
         !assignChannel(impl->map, map_result, kFastLioMapTopic) ||
         !assignChannel(impl->map_delta, map_delta_result, kFastLioMapDeltaTopic) ||
+        !assignChannel(impl->map_tiles, map_tiles_result, kFastLioMapTilesTopic) ||
         !assignChannel(impl->imu, imu_result, kFastLioImuTopic) ||
         !assignChannel(impl->odom, odom_result, "/odometry") ||
         !assignChannel(impl->path, path_result, "/path") ||
@@ -299,28 +320,57 @@ void FoxglovePublisher::stop() {
     if (!impl) {
         return;
     }
-
-    if (impl->cloud) impl->cloud->close();
-    if (impl->map) impl->map->close();
-    if (impl->map_delta) impl->map_delta->close();
-    if (impl->imu) impl->imu->close();
-    if (impl->odom) impl->odom->close();
-    if (impl->path) impl->path->close();
-    if (impl->tf) impl->tf->close();
-    if (impl->server) impl->server->stop();
-
-    delete impl;
+    // Remove the published pointer before calling third-party code. Even if a
+    // close operation throws, no later destructor/stop attempt can re-enter a
+    // half-closed SDK object.
     server_impl_ = nullptr;
     client_count_ = 0;
+
+    std::exception_ptr first_failure;
+    const auto contain = [&first_failure](auto&& operation) {
+        try {
+            operation();
+        } catch (...) {
+            if (!first_failure) first_failure = std::current_exception();
+        }
+    };
+    contain([&] { if (impl->cloud) impl->cloud->close(); });
+    contain([&] { if (impl->map) impl->map->close(); });
+    contain([&] { if (impl->map_delta) impl->map_delta->close(); });
+    contain([&] { if (impl->map_tiles) impl->map_tiles->close(); });
+    contain([&] { if (impl->imu) impl->imu->close(); });
+    contain([&] { if (impl->odom) impl->odom->close(); });
+    contain([&] { if (impl->path) impl->path->close(); });
+    contain([&] { if (impl->tf) impl->tf->close(); });
+    // Always attempt to stop the service, even if a channel close failed.
+    contain([&] {
+        if (!impl->server) return;
+        const fg::FoxgloveError error = impl->server->stop();
+        if (error != fg::FoxgloveError::Ok) {
+            throw std::runtime_error(
+                std::string("Foxglove WebSocket server stop failed: ") +
+                fg::strerror(error));
+        }
+    });
+    delete impl;
+    if (first_failure) std::rethrow_exception(first_failure);
 }
 
 size_t FoxglovePublisher::getClientCount() const {
-    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
-    auto* impl = getImpl(server_impl_);
-    if (!impl || !impl->server || !running_) {
-        return 0;
+    // Connection callbacks maintain this atomic count.  Reading it directly
+    // keeps the SLAM admission path independent of SDK/internal server locks.
+    return running_ ? client_count_.load() : 0;
+}
+
+FoxglovePublisher::MapTimingStats FoxglovePublisher::mapTimingStats() const {
+    BoundedTimingWindow<> serialize;
+    BoundedTimingWindow<> send;
+    {
+        std::lock_guard<std::mutex> lock(timing_mutex_);
+        serialize = map_serialize_timing_;
+        send = map_send_timing_;
     }
-    return impl->server->clientCount();
+    return MapTimingStats{serialize.summary(), send.summary()};
 }
 
 void FoxglovePublisher::publishPointCloud(const PointCloudXYZI& cloud, double timestamp) {
@@ -341,15 +391,29 @@ void FoxglovePublisher::publishMap(const PointCloudXYZI& map, double timestamp) 
 
     // Packing grows linearly with the full map. Keep that work outside the
     // lifecycle mutex so odometry/TF publishing is not blocked by map building.
+    const auto serialize_begin = std::chrono::steady_clock::now();
     auto msg = makePointCloudMessage(map, timestamp);
-
-    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
-    auto* impl = getImpl(server_impl_);
-    if (!impl || !impl->map || !running_) {
-        return;
+    const double serialize_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - serialize_begin).count();
+    {
+        std::lock_guard<std::mutex> timing_lock(timing_mutex_);
+        map_serialize_timing_.record(serialize_ms);
     }
 
-    impl->map->log(msg, doubleToNs(timestamp));
+    double send_ms = 0.0;
+    {
+        std::shared_lock<std::shared_mutex> lock(publish_mutex_);
+        auto* impl = getImpl(server_impl_);
+        if (!impl || !impl->map || !running_) {
+            return;
+        }
+        const auto send_begin = std::chrono::steady_clock::now();
+        impl->map->log(msg, doubleToNs(timestamp));
+        send_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - send_begin).count();
+    }
+    std::lock_guard<std::mutex> timing_lock(timing_mutex_);
+    map_send_timing_.record(send_ms);
 }
 
 void FoxglovePublisher::publishMapDelta(const PointCloudXYZI& delta, double timestamp) {
@@ -366,6 +430,64 @@ void FoxglovePublisher::publishMapDelta(const PointCloudXYZI& delta, double time
     }
 
     impl->map_delta->log(msg, doubleToNs(timestamp));
+}
+
+void FoxglovePublisher::publishMapTile(
+    const TileUpdate& tile, double voxel_size, double timestamp)
+{
+    if (!running_) return;
+
+    const std::string entity_id =
+        "tile/" + std::to_string(tile.key.x) + "/" +
+        std::to_string(tile.key.y) + "/" + std::to_string(tile.key.z);
+    fgm::SceneUpdate update;
+    if (tile.deleted) {
+        fgm::SceneEntityDeletion deletion;
+        deletion.timestamp = toFoxgloveTimestamp(timestamp);
+        deletion.type =
+            fgm::SceneEntityDeletion::SceneEntityDeletionType::MATCHING_ID;
+        deletion.id = entity_id;
+        update.deletions.push_back(std::move(deletion));
+    } else {
+        fgm::SceneEntity entity;
+        entity.timestamp = toFoxgloveTimestamp(timestamp);
+        entity.frame_id = kFastLioMapFrame;
+        entity.id = entity_id;
+        entity.lifetime = fgm::Duration{0, 0};
+        entity.frame_locked = false;
+        entity.metadata.push_back(
+            fgm::KeyValuePair{"version", std::to_string(tile.version)});
+        entity.metadata.push_back(fgm::KeyValuePair{
+            "tile_key", std::to_string(tile.key.x) + "," +
+                std::to_string(tile.key.y) + "," +
+                std::to_string(tile.key.z)});
+        entity.cubes.reserve(tile.points.size());
+        const double cell_size = std::max(voxel_size, 0.001);
+        for (const PointType& point : tile.points.points) {
+            fgm::Pose pose;
+            pose.position = fgm::Vector3{point.x, point.y, point.z};
+            pose.orientation = fgm::Quaternion{0.0, 0.0, 0.0, 1.0};
+
+            // A compact blue-to-yellow intensity ramp keeps voxel entities
+            // readable without retaining any client-side state beyond the
+            // SceneEntity itself.
+            const double normalized = std::clamp(
+                static_cast<double>(point.intensity) / 255.0, 0.0, 1.0);
+            fgm::CubePrimitive cube;
+            cube.pose = std::move(pose);
+            cube.size = fgm::Vector3{cell_size, cell_size, cell_size};
+            cube.color = fgm::Color{
+                normalized, 0.35 + 0.45 * normalized,
+                1.0 - 0.65 * normalized, 0.9};
+            entity.cubes.push_back(std::move(cube));
+        }
+        update.entities.push_back(std::move(entity));
+    }
+
+    std::shared_lock<std::shared_mutex> lock(publish_mutex_);
+    auto* impl = getImpl(server_impl_);
+    if (!impl || !impl->map_tiles || !running_) return;
+    impl->map_tiles->log(update, doubleToNs(timestamp));
 }
 
 void FoxglovePublisher::publishImu(const ImuData& imu) {

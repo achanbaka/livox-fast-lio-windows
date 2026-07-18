@@ -104,9 +104,13 @@ set(IKFOM_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 
 # ─── Include directories ───────────────────────────────────────────
 include_directories(
-    ${LIVOX_SDK_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # The project compatibility header is also named livox_sdk.h.  Keep it
+    # ahead of the vendor include directory so non-SDK test targets use the
+    # stub declarations; the application selects the real header explicitly
+    # through LIVOX_REAL_SDK_HEADER.
+    ${LIVOX_SDK_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
     ${PCL_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIR}
@@ -120,6 +124,11 @@ add_definitions(-DROOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/")
 set(FAST_LIO_SOURCES
     src/main.cpp
     src/async_map_publisher.cpp
+    src/tiled_map_store.cpp
+    src/foxglove_output_worker.cpp
+    src/realtime_foxglove_worker.cpp
+    src/map_build_worker.cpp
+    src/storage_worker.cpp
     src/laser_mapping.cpp
     src/preprocess.cpp
     src/livox_adapter.cpp
@@ -148,6 +157,7 @@ target_link_libraries(livox_fast_lio
     ${LIVOX_SDK_LIBS}
     ws2_32    # Windows sockets
     bcrypt    # Windows crypto support
+    psapi     # process RSS metrics
 )
 
 if(LIVOX_SDK_LIBS)
@@ -179,7 +189,9 @@ if(LZ4_INCLUDE_DIR AND LZ4_LIBRARY)
 endif()
 
 # ─── Install ────────────────────────────────────────────────────────
-install(TARGETS livox_fast_lio RUNTIME DESTINATION bin)
+install(TARGETS livox_fast_lio foxglove_cpp
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION bin)
 install(DIRECTORY config/ DESTINATION config)
 
 # ─── Copy config to build directory ─────────────────────────────────
@@ -190,7 +202,17 @@ enable_testing()
 add_executable(livox_fast_lio_tests
     tests/test_livox_fast_lio.cpp
     src/async_map_publisher.cpp
+    src/tiled_map_store.cpp
+    src/foxglove_output_worker.cpp
+    src/realtime_foxglove_worker.cpp
+    src/map_build_worker.cpp
+    src/storage_worker.cpp
     src/foxglove_publisher.cpp
+    src/bag_writer.cpp
+    src/bag_reader.cpp
+    src/ros_bag.cpp
+    src/livox_adapter.cpp
+    src/livox_sdk_stub.cpp
     src/lvx_reader.cpp
     src/yaml_config.cpp
 )
@@ -205,6 +227,68 @@ target_link_libraries(livox_fast_lio_tests PRIVATE
     foxglove_cpp
 )
 add_test(NAME livox_fast_lio_tests COMMAND livox_fast_lio_tests)
+
+add_executable(realtime_foxglove_worker_tests
+    tests/test_realtime_foxglove_worker.cpp
+    src/realtime_foxglove_worker.cpp
+)
+target_include_directories(realtime_foxglove_worker_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PCL_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(realtime_foxglove_worker_tests PRIVATE
+    ${PCL_LIBRARIES}
+)
+add_test(NAME realtime_foxglove_worker_tests
+         COMMAND realtime_foxglove_worker_tests)
+
+# Keep Windows binaries self-contained enough to launch from Explorer.  PCL's
+# vcpkg package is dynamically linked, while Visual Studio normally relies on
+# the developer-shell PATH to locate those DLLs.  That makes a freshly built
+# executable fail with "pcl_io.dll was not found" when launched directly.
+if(WIN32)
+    get_filename_component(FAST_LIO_PCL_PREFIX
+        "${PCL_DIR}/../.." ABSOLUTE)
+    set(FAST_LIO_PCL_RELEASE_BIN "${FAST_LIO_PCL_PREFIX}/bin")
+    set(FAST_LIO_PCL_DEBUG_BIN "${FAST_LIO_PCL_PREFIX}/debug/bin")
+
+    function(fast_lio_deploy_runtime_dlls target_name)
+        if(EXISTS "${FAST_LIO_PCL_RELEASE_BIN}/pcl_io.dll")
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    "-DSOURCE_DIR=$<IF:$<CONFIG:Debug>,${FAST_LIO_PCL_DEBUG_BIN},${FAST_LIO_PCL_RELEASE_BIN}>"
+                    "-DDESTINATION_DIR=$<TARGET_FILE_DIR:${target_name}>"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/deploy_runtime_dlls.cmake"
+                COMMENT "Deploying PCL runtime DLLs for ${target_name}"
+                VERBATIM)
+        endif()
+    endfunction()
+
+    fast_lio_deploy_runtime_dlls(livox_fast_lio)
+    fast_lio_deploy_runtime_dlls(livox_fast_lio_tests)
+    fast_lio_deploy_runtime_dlls(realtime_foxglove_worker_tests)
+
+    # Keep `cmake --install` as self-contained as the build tree.  The PCL
+    # vcpkg bin directory also contains PCL's transitive Boost/FLANN/QHull and
+    # compression DLLs, so copying only pcl_*.dll is insufficient.  Release
+    # binaries are valid for all non-Debug configurations; Debug gets the
+    # matching debug/bin set when it is available.
+    if(EXISTS "${FAST_LIO_PCL_RELEASE_BIN}/pcl_io.dll")
+        install(DIRECTORY "${FAST_LIO_PCL_RELEASE_BIN}/"
+            DESTINATION bin
+            CONFIGURATIONS Release RelWithDebInfo MinSizeRel
+            FILES_MATCHING PATTERN "*.dll")
+    endif()
+    # Debug vcpkg DLLs use a `d` suffix (for example pcl_iod.dll), so test the
+    # directory rather than a release-mode filename.
+    if(IS_DIRECTORY "${FAST_LIO_PCL_DEBUG_BIN}")
+        install(DIRECTORY "${FAST_LIO_PCL_DEBUG_BIN}/"
+            DESTINATION bin
+            CONFIGURATIONS Debug
+            FILES_MATCHING PATTERN "*.dll")
+    endif()
+endif()
 
 message(STATUS "=== livox-fast-lio-windows Build Configuration ===")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")

@@ -42,13 +42,43 @@ publish:
     scan_bodyframe_pub_en: true
     publish_full_map: true
     async_full_map_publish: true
-    full_map_publish_interval_ms: 1000
+    full_map_publish_interval_ms: 5000
     full_map_voxel_size: 0.2    # keep visualization snapshots bounded while SLAM remains at 0.05 m
     bag_full_map_periodic: false
-    publish_map_delta: false
+    publish_map_delta: true      # legacy compatibility; map_output.mode is authoritative
     map_delta_max_pending_points: 200000
     foxglove_control_interval_ms: 20  # smooth Foxglove playback clock (up to 50 Hz)
     foxglove_backlog_size: 64
+
+map_output:
+    mode: hybrid                 # persistent SceneUpdate Tiles plus a compatibility PointCloud snapshot
+    full_publish_interval_ms: 5000 # low-rate /map snapshot; a new client still triggers an immediate resync
+    full_voxel_leaf_m: 0.2        # matches legacy publish.full_map_voxel_size
+    tile_size_m: 20.0
+    tile_voxel_leaf_m: 0.2
+    voxel_update_policy: latest   # first | latest | centroid
+    tile_publish_hz: 10
+    max_tiles_per_update: 32
+    max_points_per_update: 200000 # matches legacy publish.map_delta_max_pending_points
+    input_queue_capacity: 64
+    input_queue_max_mb: 128
+    max_memory_mb: 1024
+    memory_policy: stop_accumulating # spill_to_disk is not enabled until its on-disk format lands
+
+foxglove:
+    current_cloud_publish_hz: 20
+    path_publish_hz: 2
+    backlog_size: 64              # matches legacy publish.foxglove_backlog_size
+
+storage:
+    mode: realtime                # realtime | reliable
+    queue_max_mb: 512
+    bag_path_publish_hz: 1
+    path_max_points: 100000       # bounded rolling Path; Odom remains complete
+    pcd_format: binary_compressed
+    pcd_chunk_points: 1000000
+    pcd_chunk_frames: 0
+    save_final_ikdtree: true
 
 pcd_save:
     pcd_save_en: true

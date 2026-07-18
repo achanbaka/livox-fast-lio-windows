@@ -5,7 +5,7 @@
 **Native Windows FAST-LIO2 SLAM application** — supports real-time mapping with Livox Horizon LiDAR, Livox SDK1 / LVX v1.1 playback, and ROS1 Bag playback.
 ![Demo](Screen_Record.gif)
 
-Based on the [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) algorithm, this project removes the ROS dependency and runs natively on Windows. It can parse Livox SDK1 `.lvx` recordings directly, read and write ROS1 Bag files, and stream mapping results to [Foxglove Studio](https://foxglove.dev/) in real time.
+Based on the [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) algorithm, this project removes the ROS runtime dependency and runs natively on Windows. It can parse Livox SDK1 `.lvx` recordings directly, read and write ROS1 Bag files, and stream mapping results to [Foxglove Studio](https://foxglove.dev/) in real time. Long-running maps can use a bounded-memory Dirty Tile pipeline; full-map generation, live visualization, Bag output, and PCD output all run outside the SLAM thread.
 
 ---
 
@@ -22,6 +22,7 @@ Based on the [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) algorithm, this p
   - [LVX Playback Mode](#lvx-playback-mode)
   - [Bag Playback Mode](#bag-playback-mode)
   - [Foxglove Visualization](#foxglove-visualization)
+  - [Map Output Modes](#map-output-modes)
 - [Configuration File](#configuration-file)
 - [Project Structure](#project-structure)
 - [Output Files](#output-files)
@@ -37,9 +38,12 @@ Based on the [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) algorithm, this p
 - **Livox Horizon support** — receives real-time point cloud and IMU data through Livox SDK
 - **Livox SDK1 LVX v1.1 playback** — replays recorded `.lvx` files without hardware, with synchronized point cloud and IMU data
 - **ROS1 Bag file read/write** — reads `.bag` files exported by Livox Viewer as input and writes SLAM results to an output bag file
-- **Foxglove Studio visualization** — view the accumulated map, current frame cloud, odometry, path, and TF transforms in real time through `ws://localhost:8765`
+- **Scalable map output** — `full_async`, `tiled_incremental`, and `hybrid` modes; the high-density configuration publishes persistent Dirty Tiles together with low-rate full PointCloud snapshots by default
+- **Bounded asynchronous pipeline** — map building, Foxglove sends, Bag writes, and compressed PCD writes use separate workers with explicit queue and memory limits, keeping heavy I/O out of IEKF
+- **Foxglove Studio visualization** — view the `/map` full map or persistent `/map_tiles`, current frame cloud, odometry, path, and TF transforms through `ws://localhost:8765`
 - **Playback control** — Foxglove playback time is synchronized with the current SLAM time; pause, resume, and playback speed changes are supported, while seek by dragging is not currently available
-- **PCD point cloud saving** — automatically saves the global map as PCD files
+- **Asynchronous chunked PCD output** — binary and binary-compressed formats with point- or frame-based chunking, avoiding an unbounded single in-memory PCD buffer
+- **Observability and bounded shutdown** — logs queue peaks, drops/merges, memory, and average/P95/P99 timing; workers use bounded drain and shutdown deadlines
 - **YAML configuration** — flexible parameter configuration with command-line overrides
 - **No ROS dependency** — fully native Windows application, no ROS installation required
 
@@ -98,6 +102,12 @@ cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=third_party/vcpkg/scripts/buildsystem
 
 # Build with multiple threads; adjust -j according to your CPU core count
 cmake --build build --config Release -j16
+
+# Run automated tests
+ctest --test-dir build -C Release --output-on-failure
+
+# Optional: create a redistributable installation directory
+cmake --install build --config Release --prefix dist
 ```
 
 After a successful build, the executable is located at:
@@ -106,7 +116,10 @@ After a successful build, the executable is located at:
 build\Release\livox_fast_lio.exe
 ```
 
-> **Tip:** CMake automatically copies the `config/` directory to `build\config/` and deploys all dependency DLLs to `build\Release/`.
+The installed executable is `dist\bin\livox_fast_lio.exe`, and installed
+configuration files are under `dist\config\`.
+
+> **Tip:** CMake automatically copies `config/` to `build\config/` and deploys PCL, Foxglove SDK, and other runtime DLLs next to the executable. The installation also includes `pcl_io.dll` and `foxglove_cpp.dll`; no manual copying from vcpkg is required.
 > If `third_party/Livox-SDK` exists, CMake builds `sdk_core` and links the real Livox SDK automatically. It falls back to `src/livox_sdk_stub.cpp` only when the SDK is absent.
 
 ---
@@ -136,11 +149,13 @@ livox_fast_lio.exe [config_path] [--lvx <file>] [--bag <file>] [key=value ...]
 # Specify a configuration file
 .\livox_fast_lio.exe D:\path\to\horizon.yaml
 
-# Use the high-density Horizon configuration
+# Use the high-density Horizon configuration (hybrid: Tiles + full PointCloud snapshots)
 .\livox_fast_lio.exe config\horizon_hd.yaml pcd_save_en=false
 
-# Replay an LVX file. For long recordings, disable PCD saving first.
-.\livox_fast_lio.exe config\horizon.yaml --lvx "D:\data\recording.lvx" pcd_save_en=false
+# Replay an LVX file. For visualization/performance-only runs, disable both
+# chunked PCD output and the final ikd-Tree export.
+.\livox_fast_lio.exe config\horizon_hd.yaml --lvx "D:\data\recording.lvx" `
+  pcd_save_en=false storage.save_final_ikdtree=false
 
 # Replay a bag file exported by Livox Viewer
 .\livox_fast_lio.exe --bag D:\data\recording.bag
@@ -153,7 +168,16 @@ livox_fast_lio.exe [config_path] [--lvx <file>] [--bag <file>] [key=value ...]
 
 # Override multiple parameters
 .\livox_fast_lio.exe blind=2 max_iter=15 filter_size_map=0.3
+
+# Temporarily switch the map output mode
+.\livox_fast_lio.exe config\horizon_hd.yaml --lvx "D:\data\test.lvx" `
+  map_output.mode=full_async
 ```
+
+`key=value` accepts both legacy top-level override names and grouped names such
+as `map_output.mode`, `storage.mode`, and
+`foxglove.current_cloud_publish_hz`. If an option appears more than once, the
+last command-line value wins.
 
 ### Real-Time LiDAR Mode
 
@@ -161,7 +185,7 @@ The default mode connects to a Livox Horizon device and runs real-time SLAM:
 
 ```powershell
 cd build\Release
-.\livox_fast_lio.exe
+.\livox_fast_lio.exe ..\config\horizon.yaml
 ```
 
 After startup, the program will:
@@ -182,7 +206,7 @@ You can test the full SLAM pipeline without hardware by replaying `.lvx` files r
 .\livox_fast_lio.exe config\horizon.yaml --lvx "D:\data\my_recording.lvx" pcd_save_en=false
 ```
 
-LVX playback reads the file header, device information, and the number of valid non-empty frames. Empty frames at the end of the file are treated as normal EOF. During playback, point cloud and IMU data are pushed according to LVX frame intervals and packet timestamps to approximate the original acquisition rhythm. The downstream pipeline remains the same: `LvxPoint/ImuData -> Preprocess -> Sync -> IEKF -> Foxglove/PCD`.
+LVX playback reads the file header, device information, and the number of valid non-empty frames. Empty frames at the end of the file are treated as normal EOF. During playback, point cloud and IMU data are pushed according to LVX frame intervals and packet timestamps to approximate the original acquisition rhythm. The common processing path remains `LvxPoint/ImuData -> Preprocess -> Sync -> IEKF`; downstream workers handle map building, Foxglove, and PCD output.
 
 The current LVX parser targets Livox SDK1 / LVX v1.1 data and supports the following `data_type` values:
 
@@ -220,7 +244,7 @@ The program will:
 3. Follow the ROS FAST-LIO synchronization policy by waiting until IMU data covers the LiDAR frame end time before processing, preventing LiDAR frames from running ahead
 4. Start the Foxglove WebSocket by default at `ws://localhost:8765`
 5. Publish protobuf schema data through the official Foxglove C++ SDK
-6. Write SLAM results to an output bag file named `<input_file_name>_output.bag` when the output path is writable
+6. Use the Storage Worker to write SLAM results asynchronously to `<input_file_name>_output.bag` when the output path is writable
 
 The Windows version applies the same key processing chain as ROS FAST-LIO for Livox `CustomMsg`:
 
@@ -228,7 +252,7 @@ The Windows version applies the same key processing chain as ROS FAST-LIO for Li
 - Preprocessing applies `point_filter_num=3`, blind-zone filtering, tag filtering, reflectivity-to-intensity mapping, and `offset_time` to point-time mapping
 - LiDAR/IMU synchronization waits for `last_imu_time >= lidar_end_time`
 - IEKF uses the original FAST-LIO-style `h_share_model` and `update_iterated_dyn_share_modified(0.001, solve_time)`
-- `/cloud_registered` publishes the current registered frame cloud. When `publish_full_map=true`, `/map` publishes an independent accumulated global map that is no longer affected by local ikd-Tree pruning in FAST-LIO
+- `/cloud_registered` publishes the current registered frame cloud. The map topic is selected by `map_output.mode`; both `/map` and `/map_tiles` come from an independent bounded accumulated map and are not affected by local ikd-Tree pruning in FAST-LIO
 
 ### Foxglove Visualization
 
@@ -245,7 +269,7 @@ LVX and Bag playback start the Foxglove WebSocket server by default:
 2. Select **Foxglove WebSocket**
 3. Enter `ws://localhost:8765`
 4. Add a 3D panel and set the Fixed frame to `map`
-5. Prefer displaying `/map` and `/cloud_registered` first, then add `/odometry`, `/path`, and `/tf` as needed
+5. With `horizon_hd.yaml`, display `/map_tiles` and `/cloud_registered`; a low-rate `/map` PointCloud snapshot is also retained. The other default configurations use `/map`. Add `/odometry`, `/path`, and `/tf` as needed
 
 Foxglove playback time follows the SLAM processing time broadcast. LVX and Bag playback support pause, resume, and playback speed adjustment in Foxglove. Seeking by dragging the progress bar to a specific time is not currently available because FAST-LIO state, the local ikd-Tree, the path, and the accumulated map all depend on historical LiDAR/IMU integration order and cannot be updated by only moving the file read position.
 
@@ -253,12 +277,33 @@ Real-time WebSocket topics:
 
 | Topic | Foxglove schema | Description |
 |-------|-----------------|-------------|
-| `/map` | `foxglove.PointCloud` | Fully accumulated FAST-LIO map, with frame `map`; by default it does not delete historical regions when the local ikd-Tree is pruned |
-| `/map_delta` | `foxglove.PointCloud` | Optional incremental map containing only newly accepted global voxels; `/map` remains authoritative |
+| `/map` | `foxglove.PointCloud` | Full accumulated map snapshots in `full_async` / `hybrid`, with frame `map` |
+| `/map_tiles` | `foxglove.SceneUpdate` | Persistent Tiles in `tiled_incremental` / `hybrid`; the same Tile ID is updated in place, eviction sends a deletion, and a new client triggers a current-Tile resync |
+| `/map_delta` | `foxglove.PointCloud` | Legacy incremental topic; new configurations should use `map_output.mode` and `/map_tiles` |
 | `/cloud_registered` | `foxglove.PointCloud` | Current registered frame cloud, with frame `map` |
 | `/odometry` | `foxglove.Odometry` | SLAM odometry, with body frame `base_link` |
 | `/path` | `foxglove.PosesInFrame` | Motion trajectory |
 | `/tf` | `foxglove.FrameTransforms` | Coordinate transform from `base_link` to `map` |
+| `/imu` | `livox_fast_lio/Imu` (JSON) | IMU data, with frame `livox_imu` |
+
+### Map Output Modes
+
+`map_output.mode` is authoritative for map output behavior. Legacy
+`publish.*` map fields are still mapped to compatible behavior when the
+`map_output` group is absent.
+
+| Mode | Foxglove map output | Recommended use |
+|------|----------------------|-----------------|
+| `full_async` | `/map` only | Legacy layout compatibility, smaller maps, and tools that require one complete PointCloud |
+| `tiled_incremental` | `/map_tiles` only | Long-running or high-density mapping; each update scales with changed regions |
+| `hybrid` | `/map` + `/map_tiles` | Migration and comparison; highest resource cost |
+
+All modes accumulate a bounded voxel map in the background. Tile mode sends
+Dirty Tile updates and merges queued work for the same Tile; full-map mode
+builds snapshots at the configured interval. In `hybrid` mode, the number of
+consecutive Tile outputs is bounded so a pending `/map` snapshot cannot be
+starved by continuously updated Tiles. A slow or disconnected network client
+does not make the SLAM thread serialize point clouds or perform network writes.
 
 ---
 
@@ -266,7 +311,7 @@ Real-time WebSocket topics:
 
 Default configuration file: [`config/horizon.yaml`](config/horizon.yaml)
 
-High-density configuration: [`config/horizon_hd.yaml`](config/horizon_hd.yaml). It reduces `filter_size_surf` and `filter_size_map` from `0.5 m` to `0.2 m`, and sets `point_filter_num` to `1` for denser mapping. This improves map density but increases CPU and memory usage.
+High-density configuration: [`config/horizon_hd.yaml`](config/horizon_hd.yaml). It reduces `filter_size_surf` and `filter_size_map` from `0.5 m` to `0.05 m`, sets `point_filter_num` to `1`, raises the live frame point threshold to `30000`, sets the IEKF iteration limit to `4`, raises the feature limit to `4000`, and uses `hybrid` by default. `/map_tiles` continuously publishes Dirty Tiles, while `/map` retains a full `foxglove.PointCloud` snapshot with a 5-second minimum interval and immediately resynchronizes a newly connected client. If snapshot construction or network delivery is slow, the runtime lengthens the actual full-map interval to avoid output backlog. This improves map density but increases CPU and memory usage. Visualization uses an independent `0.2 m` Tile voxel so SLAM precision does not directly become network load.
 
 ### common — General Settings
 
@@ -318,25 +363,79 @@ High-density configuration: [`config/horizon_hd.yaml`](config/horizon_hd.yaml). 
 | `scan_publish_en` | bool | `true` | Whether to publish point clouds. `false` disables all point cloud output |
 | `dense_publish_en` | bool | `true` | Whether to publish dense point clouds. `false` enables downsampling |
 | `scan_bodyframe_pub_en` | bool | `true` | Whether to publish point clouds in the IMU body frame |
-| `publish_full_map` | bool | `true` | Whether `/map` publishes the fully accumulated map. When false, it falls back to the local ikd-Tree map |
-| `async_full_map_publish` | bool | `true` | Accumulates map frames, builds snapshots, and publishes them to Foxglove off the SLAM thread |
-| `full_map_publish_interval_ms` | int | `1000` | Minimum interval between full-map snapshots in milliseconds (minimum 100) |
+| `publish_full_map` | bool | `true` | Legacy compatibility field; `map_output.mode` controls whether new configurations publish `/map` |
+| `async_full_map_publish` | bool | `true` | Legacy compatibility field; full maps are always built and published in the background |
+| `full_map_publish_interval_ms` | int | `1000` | Legacy full-map interval; maps to `map_output.full_publish_interval_ms` |
+| `full_map_voxel_size` | double | `0.2` | Legacy full-map output voxel; maps to `map_output.full_voxel_leaf_m` |
 | `bag_full_map_periodic` | bool | `false` | Periodically writes full `/map` messages to the output bag; false writes only the final map |
-| `publish_map_delta` | bool | `false` | Publishes experimental `/map_delta` messages containing newly accepted global voxels |
-| `map_delta_max_pending_points` | int | `200000` | Maximum queued delta points; overflow drops stale deltas and requests a full-map resync |
+| `publish_map_delta` | bool | `false` | Legacy compatibility field; new configurations use `map_output.mode=tiled_incremental` |
+| `map_delta_max_pending_points` | int | `200000` | Legacy incremental limit; maps to `map_output.max_points_per_update` |
+| `foxglove_control_interval_ms` | int | `20` | Foxglove playback-clock and playback-state update interval in milliseconds; clamped to at least `10` at runtime |
+| `foxglove_backlog_size` | int | `64` | Legacy compatibility field; maps to `foxglove.backlog_size` and controls the WebSocket message backlog; clamped to at least `8` at runtime |
+
+### map_output — Scalable Map Output
+
+| Parameter | Type | Horizon default | Description |
+|-----------|------|-----------------|-------------|
+| `mode` | string | `full_async` | `full_async`, `tiled_incremental`, or `hybrid`; `horizon_hd.yaml` defaults to `hybrid` |
+| `full_publish_interval_ms` | int | `1000` | Minimum `/map` snapshot interval in milliseconds; clamped to at least 100 at runtime |
+| `full_voxel_leaf_m` | double | `0.2` | Full-map output voxel leaf size in meters, independent of ikd-Tree precision |
+| `tile_size_m` | double | `20.0` | Spatial Tile side length in meters |
+| `tile_voxel_leaf_m` | double | `0.2` | Tile voxel size in meters; `tile_size_m` must be an integer multiple |
+| `voxel_update_policy` | string | `latest` | Use `first`, `latest`, or `centroid` for repeated updates to one voxel |
+| `tile_publish_hz` | int | `10` | Dirty Tile extraction and publication rate |
+| `max_tiles_per_update` | int | `32` | Maximum Tiles per publication batch |
+| `max_points_per_update` | int | `200000` | Maximum points per Tile publication batch |
+| `input_queue_capacity` | int | `64` | Maximum map-build input Tile tasks; queued work for the same Tile can merge |
+| `input_queue_max_mb` | int | `128` | Hard map-build input queue byte limit in MiB |
+| `max_memory_mb` | int | `1024` | Estimated bounded accumulated-map memory limit in MiB |
+| `memory_policy` | string | `stop_accumulating` | On the limit use `stop_accumulating`, `lru`, or `evict_far`; `spill_to_disk` is not implemented and warns before falling back to `stop_accumulating` |
+
+### foxglove — Live Output Queue
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `current_cloud_publish_hz` | double | `20` | Maximum `/cloud_registered` publication rate |
+| `path_publish_hz` | double | `2` | Maximum `/path` publication rate |
+| `backlog_size` | int | `64` | Foxglove WebSocket message backlog |
+
+Odometry, TF, the current cloud, path, and IMU use a bounded live-output
+worker. Replaceable data follows latest-wins behavior; cloud overload is
+counted as a drop instead of propagating network backpressure into IEKF.
+
+### storage — Bag and PCD Worker
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mode` | string | `realtime` | `realtime` drops older tasks on overload and keeps SLAM running; `reliable` never drops silently and marks storage failed after capacity or write failure |
+| `queue_max_mb` | int | `512` | Byte limit in MiB for the shared Bag/PCD queue plus in-flight payload |
+| `bag_path_publish_hz` | double | `1` | `/path` write rate in the output Bag |
+| `path_max_points` | int | `100000` | Maximum rolling Path points in memory and Bag; odometry is still retained per frame |
+| `pcd_format` | string | `binary_compressed` | `binary` or `binary_compressed` |
+| `pcd_chunk_points` | int | `1000000` | Point-count trigger for each PCD chunk |
+| `pcd_chunk_frames` | int | `0` | Optional frame-count trigger; `0` disables it |
+| `save_final_ikdtree` | bool | `true` | Also export `PCD/ikd_tree_map.pcd` during shutdown; independent of `pcd_save_en` |
 
 ### pcd_save — Point Cloud Saving
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `pcd_save_en` | bool | `true` | Whether to save PCD files |
-| `interval` | int | `-1` | Number of frames saved per PCD file. `-1` means all frames are saved to one file |
+| `pcd_save_en` | bool | `true` | Asynchronously write registered frames to `PCD/scans_*.pcd` chunks |
+| `interval` | int | `-1` | Legacy frame-based chunk setting; migrated only when `storage.pcd_chunk_frames` is absent and the value is greater than 0 |
+
+Setting only `pcd_save_en=false` does not disable the final ikd-Tree export.
+For playback performance tests, usually also set
+`storage.save_final_ikdtree=false`.
 
 ### runtime — Runtime Logging
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `runtime_pos_log_enable` | bool | `false` | Whether to output more detailed per-frame timing, point count, and map size logs |
+| `runtime_pos_log_enable` | bool | `false` | Whether to write the additional legacy position text log; structured `Log/runtime.txt` is always generated |
+
+`Log/runtime.txt` contains per-frame timing, current and peak input/output
+queues, Tile merge/drop/resync counters, process RSS, and average/P95/P99
+summaries for map building, serialization, sends, Bag, PCD, and flushes.
 
 ---
 
@@ -347,9 +446,14 @@ livox-fast-lio-windows/
 ├── CMakeLists.txt              # CMake build configuration
 ├── vcpkg.json                  # vcpkg dependency manifest (manifest mode)
 ├── config/
-│   ├── horizon.yaml            # Default Livox Horizon configuration (0.5 m voxels)
-│   └── horizon_hd.yaml         # High-density Livox Horizon configuration (0.2 m voxels)
+│   ├── avia.yaml               # Livox Avia configuration
+│   ├── horizon.yaml            # Default Horizon configuration (0.5 m SLAM voxels)
+│   ├── horizon_hd.yaml         # High-density Horizon (0.05 m, Tile + PointCloud snapshots)
+│   └── mid360.yaml             # Livox Mid-360 configuration
+├── cmake/
+│   └── deploy_runtime_dlls.cmake # Post-build deployment of PCL, Foxglove, and other runtime DLLs
 ├── include/
+│   ├── bounded_timing_stats.h  # Fixed-capacity timing windows and P95/P99 summaries
 │   ├── common_lib.h            # Common utility functions
 │   ├── Exp_mat.h               # Exponential map / SO3 math utilities
 │   ├── so3_math.h              # SO(3) group operations
@@ -360,7 +464,14 @@ livox-fast-lio-windows/
 │   ├── preprocess.h            # Point cloud preprocessing for Livox, Velodyne, and Ouster
 │   ├── fast_lio_observation.h  # FAST-LIO point-to-plane observation constants and residual thresholds
 │   ├── lidar_imu_sync.h        # LiDAR/IMU frame-end coverage synchronization check
+│   ├── playback_status.h        # Playback terminal states and safe log error text
 │   ├── map_accumulator.h       # Full accumulated map cache for Foxglove/Bag output
+│   ├── async_map_publisher.h    # Legacy full-map asynchronous publisher retained for compatibility tests
+│   ├── tiled_map_store.h       # Bounded Tile/voxel map with dirty and eviction tracking
+│   ├── map_build_worker.h      # Tile input coalescing, map building, and snapshot barriers
+│   ├── foxglove_output_worker.h # Bounded map network-output queue
+│   ├── realtime_foxglove_worker.h # Pose, current cloud, path, and IMU output queue
+│   ├── storage_worker.h        # Asynchronous Bag and chunked-PCD storage queue
 │   ├── livox_adapter.h         # Livox SDK adapter
 │   ├── livox_sdk.h             # Livox SDK compatibility header; forwards to the official header when available
 │   ├── lvx_reader.h            # LVX file reading and playback
@@ -380,11 +491,20 @@ livox-fast-lio-windows/
 │   ├── livox_adapter.cpp       # Livox SDK adapter implementation
 │   ├── livox_sdk_stub.cpp      # Livox SDK stub, used only when the official SDK is absent
 │   ├── lvx_reader.cpp          # LVX playback implementation
+│   ├── async_map_publisher.cpp  # Legacy full-map asynchronous publisher retained for compatibility tests
 │   ├── foxglove_publisher.cpp  # Official Foxglove SDK WebSocket publishing implementation
+│   ├── tiled_map_store.cpp     # Bounded Tile map implementation
+│   ├── map_build_worker.cpp    # Asynchronous map building
+│   ├── foxglove_output_worker.cpp # Map publication worker
+│   ├── realtime_foxglove_worker.cpp # Live-topic publication worker
+│   ├── storage_worker.cpp      # Bag/PCD storage worker
 │   ├── ros_bag.cpp             # Low-level bag parsing: decompression and record parsing
 │   ├── bag_reader.cpp          # High-level bag reading: topic routing and message dispatch
 │   ├── bag_writer.cpp          # Bag writing: chunks, connections, and indexes
 │   └── yaml_config.cpp         # Configuration loading implementation
+├── tests/
+│   ├── test_livox_fast_lio.cpp # Configuration, playback, map, storage, and output-pipeline tests
+│   └── test_realtime_foxglove_worker.cpp # Realtime Foxglove Worker tests
 ├── third_party/
 │   ├── foxglove-sdk/           # Foxglove C++ SDK redistributable
 │   ├── IKFoM_toolkit/          # Iterated Kalman filter on manifold toolkit
@@ -398,12 +518,17 @@ livox-fast-lio-windows/
 
 ## Output Files
 
-At runtime, the program creates the following directories under `ROOT_DIR`, the source root directory:
+By default, runtime output is created under the **current working directory at
+startup**. Use the command-line override
+`root_dir=D:\path\to\output` to select an independent output root. The startup
+log prints the resolved `Output root`.
 
 | Path | Content |
 |------|---------|
-| `Log/` | Runtime logs, including IMU data and pose estimates |
-| `PCD/` | Global map PCD files |
+| `Log/runtime.txt` | Structured per-frame log plus input, map, Foxglove, Storage, timing, and memory summaries |
+| `Log/imu.txt` | IMU debug data |
+| `PCD/scans_*.pcd` | Registered-cloud chunks from the Storage Worker; a final partial chunk is named `scans_final_*.pcd` |
+| `PCD/ikd_tree_map.pcd` | Final local ikd-Tree map, atomically written during shutdown when `storage.save_final_ikdtree=true` |
 
 In Bag mode, the output bag file is generated in the same directory as the input file:
 
@@ -473,12 +598,12 @@ The sampling path is up when the log contains:
 Run the program from the correct working directory, or specify the full path:
 
 ```powershell
-# Option 1: Run from build/Release, where config has been copied automatically
-cd build\Release
-.\livox_fast_lio.exe
+# Option 1: Run from the project root with an explicit configuration
+.\build\Release\livox_fast_lio.exe .\config\horizon.yaml
 
-# Option 2: Specify the configuration file path
-.\livox_fast_lio.exe D:\Projects\livox-fast-lio-windows\config\horizon.yaml
+# Option 2: From build/Release, use the copy under build/config
+cd build\Release
+.\livox_fast_lio.exe ..\config\horizon.yaml
 ```
 
 ### Q: It reports "SDK init failed"
@@ -504,11 +629,39 @@ LVX and Bag playback do not depend on a real-time Livox SDK connection and can b
 
 1. First confirm that Foxglove is connected to this program's live connection, `ws://localhost:8765`, not an old or incomplete output bag file.
 2. Set the 3D panel Fixed frame to `map`.
-3. During mapping, inspect `/map` first. With the default configuration it is the fully accumulated map. `/cloud_registered` is the current registered frame cloud, not the full accumulated map.
+3. Check `map_output_mode` in the startup log: select `/map` for `full_async`, `/map_tiles` for `tiled_incremental`, or either for `hybrid`. `/cloud_registered` is only the current registered frame.
 4. Normal Livox Horizon bag playback should be close to a 10 Hz LiDAR frame rate. Logs usually show about `19-21` IMU samples per frame. For LVX v1.1 playback, the number of points and IMU packets per frame depends on the recording frame interval; a common 50 ms Horizon frame may contain about `10` IMU packets.
 5. If the log repeatedly shows `No undistorted points`, `No effective points`, or the IMU count stays at 0 for a long time, there is likely still an issue with LiDAR/IMU timestamps, bag topics, or LVX packet parsing.
 
-The current Windows version follows the ROS FAST-LIO reference chain for bag and LVX playback: Livox `CustomMsg` or LVX internal point/IMU preprocessing, LiDAR/IMU frame-end coverage synchronization, original FAST-LIO-style IEKF point-to-plane observation updates, and `/map` publishing the full accumulated map every frame.
+The current Windows version follows the ROS FAST-LIO reference chain for bag and LVX playback: Livox `CustomMsg` or LVX internal point/IMU preprocessing, LiDAR/IMU frame-end coverage synchronization, and original FAST-LIO-style IEKF point-to-plane observation updates. Map output publishes background full snapshots, Dirty Tiles, or both according to `map_output.mode`.
+
+### Q: Startup reports a missing `pcl_io.dll` or another DLL
+
+Do not copy `livox_fast_lio.exe` by itself. Rebuilding deploys runtime DLLs to
+`build\Release\`:
+
+```powershell
+cmake --build build --config Release
+```
+
+Use the installation directory when redistributing the application:
+
+```powershell
+cmake --install build --config Release --prefix dist
+.\dist\bin\livox_fast_lio.exe --help
+```
+
+The current CMake install rules include `pcl_io.dll`, `foxglove_cpp.dll`, and
+the remaining PCL dependencies. If the build directory is old, rerun CMake
+configure first so a new EXE is not mixed with old DLLs.
+
+### Q: Playback exits with an invalid memory access or the process never exits
+
+Older builds could trigger unsafe destruction of the third-party ikd-Tree
+background rebuild thread during Windows process teardown. The current build
+keeps that tree for the process lifetime and stops map, Foxglove, Bag, and PCD
+workers with bounded deadlines before teardown. Rebuild the main executable
+instead of continuing to run an old EXE.
 
 ### Q: Can the Foxglove playback bar pause or seek?
 

@@ -6,8 +6,10 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -97,20 +99,39 @@ using LidarFrameCallback = std::function<void(const std::vector<LvxPoint>&, cons
 class LvxReader
 {
 public:
+    static constexpr std::size_t kMaxPlaybackErrorLength = 255;
+
+    struct PlaybackStats {
+        uint64_t failures = 0;
+        bool failed = false;
+        bool eof = false;
+        bool playing = false;
+        bool thread_exited = true;
+        // A snapshot of the most recent playback-thread exception, truncated
+        // to kMaxPlaybackErrorLength bytes.
+        std::string last_error;
+    };
+
     LvxReader();
     ~LvxReader();
 
-    bool open(const std::string& filepath);
+    bool open(const std::string& filepath) noexcept;
     void close();
-    void play(double speed = 1.0);
+    void play(double speed = 1.0) noexcept;
     void setSpeed(double speed);
     void pause();
     void resume();
     bool seekToTimeNs(uint64_t time_ns);
+    // Requests playback cancellation and joins only after the playback thread
+    // reports exit. A false result leaves the object alive/stopping so callers
+    // can enforce a process-wide shutdown deadline without an unbounded join.
+    bool stopFor(std::chrono::milliseconds timeout);
     void stop();
     bool isOpen() const { return file_.is_open(); }
     bool isPlaying() const { return playing_; }
     bool isEOF() const { return eof_; }
+    bool hasPlaybackFailure() const noexcept { return playback_failed_.load(); }
+    PlaybackStats playbackStats() const;
 
     void setFrameCallback(LidarFrameCallback cb) { frame_cb_ = cb; }
 
@@ -123,7 +144,12 @@ public:
     LvxFrameParseResult parsePacketsForTest(const std::vector<uint8_t>& data);
 
 private:
-    void playbackThread();
+    friend struct LvxReaderTestAccess;
+
+    void playbackThread() noexcept;
+    void finishPlaybackThread(bool reached_eof) noexcept;
+    void clearPlaybackFailure();
+    void recordPlaybackFailure(const char* message) noexcept;
     bool readFrame();
     bool sleepInterruptible(std::chrono::milliseconds duration);
     LvxFrameParseResult parseFrameData(const std::vector<uint8_t>& data,
@@ -156,12 +182,18 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> eof_{false};
+    std::atomic<bool> playback_failed_{false};
+    std::atomic<uint64_t> playback_failure_count_{0};
     std::atomic<double> playback_speed_{1.0};
 
     LidarFrameCallback frame_cb_;
     std::mutex control_mutex_;
     std::mutex pause_mutex_;
     std::condition_variable pause_cv_;
+    mutable std::mutex thread_state_mutex_;
+    std::condition_variable thread_exit_cv_;
+    std::atomic<bool> playback_thread_exited_{true};
+    std::array<char, kMaxPlaybackErrorLength + 1> last_playback_error_{};
 };
 
 #endif

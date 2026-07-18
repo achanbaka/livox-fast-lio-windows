@@ -137,6 +137,11 @@ int main(int argc, char* argv[])
 
     // Apply overrides
     yaml_config.applyOverrides(argc, argv);
+    std::string config_error;
+    if (!yaml_config.validate(config_error)) {
+        std::cerr << "Error: Invalid configuration: " << config_error << std::endl;
+        return 1;
+    }
     const std::string output_root = resolveOutputRoot(yaml_config.getConfig().root_dir);
     yaml_config.getConfig().root_dir = output_root;
 

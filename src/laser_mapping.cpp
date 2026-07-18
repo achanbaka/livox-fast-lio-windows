@@ -9,7 +9,10 @@
  */
 
 #include "laser_mapping.h"
-#include "async_map_publisher.h"
+#include "bounded_timing_stats.h"
+#include "map_build_worker.h"
+#include "realtime_foxglove_worker.h"
+#include "storage_worker.h"
 #include "IMU_Processing.hpp"
 #include "preprocess.h"
 #include "livox_adapter.h"
@@ -17,14 +20,15 @@
 #include "foxglove_publisher.h"
 #include "fast_lio_observation.h"
 #include "lidar_imu_sync.h"
-#include "map_accumulator.h"
 #include "bag_reader.h"
-#include "bag_writer.h"
+#include "playback_status.h"
 #include "ikd-Tree/ikd_Tree.h"
 #include "use-ikfom.hpp"
 #include "common_lib.h"
 
 #include <windows.h>
+#include <psapi.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <chrono>
@@ -39,10 +43,12 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -65,7 +71,16 @@ using namespace Eigen;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 
 // --- ikd-Tree map ---
-KD_TREE<pcl::PointXYZINormal> ikdtree;
+// ikd-Tree owns a background rebuild thread whose third-party destructor
+// performs an unbounded join.  A multi-million-point rebuild cannot be
+// cancelled and has been observed to keep the process alive (or touch freed
+// tree storage) after every application-owned worker, file, and socket was
+// already shut down.  Keep this application-wide map alive for the lifetime
+// of the Windows process; ExitProcess stops the rebuild thread and reclaims
+// its storage after normal main()/CRT cleanup without invoking that unsafe
+// destructor.
+static KD_TREE<pcl::PointXYZINormal>& ikdtree =
+    *new KD_TREE<pcl::PointXYZINormal>();
 
 // --- Preprocessor ---
 Preprocess p_pre;
@@ -122,14 +137,28 @@ static int    foxglove_control_interval_ms = 20;
 static size_t foxglove_backlog_size  = 64;
 static string root_dir;
 static ofstream runtime_log;
-static constexpr int MAP_PUBLISH_INTERVAL = 1;
 static constexpr size_t MAX_REPLAY_LIDAR_QUEUE = 3;
-static constexpr int FOXGLOVE_CLOUD_INTERVAL_MS = 100;
-static constexpr int FOXGLOVE_MAP_INTERVAL_MS = 1000;
-static constexpr int FOXGLOVE_PATH_INTERVAL_MS = 200;
+static constexpr size_t MAX_LIVE_LIDAR_QUEUE = 64;
+static constexpr size_t MAX_IMU_QUEUE = 4096;
+static atomic<uint64_t> input_lidar_frames_dropped{0};
+static atomic<uint64_t> input_imu_samples_dropped{0};
+static atomic<size_t> input_lidar_queue_high_water{0};
+static atomic<size_t> input_imu_queue_high_water{0};
+static int foxglove_cloud_interval_ms = 50;
+static int foxglove_path_interval_ms = 500;
 static constexpr int VERBOSE_SLAM_LOG_INTERVAL = 20;
 static atomic<bool> replay_backpressure_enabled{false};
 static atomic<bool> replay_backpressure_stop{false};
+
+static void updateAtomicHighWater(atomic<size_t>& high_water,
+                                  size_t candidate) noexcept
+{
+    size_t current = high_water.load(memory_order_relaxed);
+    while (current < candidate &&
+           !high_water.compare_exchange_weak(
+               current, candidate,
+               memory_order_relaxed, memory_order_relaxed)) {}
+}
 
 static string resolveOutputRoot(const string& configured_root)
 {
@@ -148,14 +177,171 @@ static string outputPath(const string& relative_path)
     return (std::filesystem::path(root_dir) / relative_path).string();
 }
 
+static size_t currentProcessRssBytes()
+{
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    if (!GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+            sizeof(counters)))
+    {
+        return 0;
+    }
+    return static_cast<size_t>(counters.WorkingSetSize);
+}
+
 static void writeRuntimeLog(const string& line)
 {
     if (runtime_log.is_open())
     {
         runtime_log << line << '\n';
-        runtime_log.flush();
+        static uint64_t lines_since_flush = 0;
+        if (++lines_since_flush >= 100) {
+            runtime_log.flush();
+            lines_since_flush = 0;
+        }
     }
 }
+
+// This path is reserved for a violated shutdown bound. Do not add logging,
+// allocation, stream flushing, or DLL teardown here: another thread may have
+// been stopped while owning the corresponding lock.
+[[noreturn]] static void terminateForShutdownTimeout() noexcept
+{
+    ::TerminateProcess(::GetCurrentProcess(), ERROR_TIMEOUT);
+    __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+
+class ShutdownWatchdog
+{
+public:
+    explicit ShutdownWatchdog(chrono::steady_clock::time_point deadline)
+        : deadline_(deadline)
+    {}
+
+    ShutdownWatchdog(const ShutdownWatchdog&) = delete;
+    ShutdownWatchdog& operator=(const ShutdownWatchdog&) = delete;
+
+    bool start() noexcept
+    {
+        try {
+            worker_ = thread([this] {
+                try {
+                    unique_lock<mutex> lock(mutex_);
+                    const bool cancelled = cv_.wait_until(
+                        lock, deadline_, [this] { return cancelled_; });
+                    if (!cancelled) {
+                        lock.unlock();
+                        terminateForShutdownTimeout();
+                    }
+                } catch (...) {
+                    terminateForShutdownTimeout();
+                }
+            });
+            started_ = true;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void cancelAndJoin() noexcept
+    {
+        if (!started_) return;
+        try {
+            {
+                lock_guard<mutex> lock(mutex_);
+                if (chrono::steady_clock::now() >= deadline_) {
+                    terminateForShutdownTimeout();
+                }
+                cancelled_ = true;
+            }
+            cv_.notify_all();
+            if (worker_.joinable()) worker_.join();
+            started_ = false;
+        } catch (...) {
+            terminateForShutdownTimeout();
+        }
+    }
+
+    ~ShutdownWatchdog() noexcept
+    {
+        // Only an explicit, successful cancel is allowed to disarm the hard
+        // bound. Exception unwinding during shutdown must not expose the
+        // process to unbounded worker destructors.
+        if (started_) terminateForShutdownTimeout();
+    }
+
+private:
+    chrono::steady_clock::time_point deadline_;
+    mutex mutex_;
+    condition_variable cv_;
+    thread worker_;
+    bool cancelled_ = false;
+    bool started_ = false;
+};
+
+struct PlaybackControlLifetimeState
+{
+    mutex reader_mutex;
+    LvxReader* lvx_reader = nullptr;
+    BagReader* bag_reader = nullptr;
+    atomic<uint64_t> current_time_ns{0};
+    atomic<double> speed{1.0};
+    atomic<bool> paused{false};
+    atomic<bool> pause_drain_pending{false};
+};
+
+class PlaybackReaderLifetimeGuard
+{
+public:
+    explicit PlaybackReaderLifetimeGuard(
+        shared_ptr<PlaybackControlLifetimeState> state)
+        : state_(std::move(state))
+    {}
+
+    PlaybackReaderLifetimeGuard(const PlaybackReaderLifetimeGuard&) = delete;
+    PlaybackReaderLifetimeGuard& operator=(
+        const PlaybackReaderLifetimeGuard&) = delete;
+
+    void setLvxReader(LvxReader* reader)
+    {
+        lock_guard<mutex> lock(state_->reader_mutex);
+        state_->lvx_reader = reader;
+        state_->bag_reader = nullptr;
+    }
+
+    void setBagReader(BagReader* reader)
+    {
+        lock_guard<mutex> lock(state_->reader_mutex);
+        state_->bag_reader = reader;
+        state_->lvx_reader = nullptr;
+    }
+
+    void disarm() noexcept
+    {
+        if (!state_) return;
+        try {
+            auto state = state_;
+            {
+                lock_guard<mutex> lock(state->reader_mutex);
+                state->lvx_reader = nullptr;
+                state->bag_reader = nullptr;
+            }
+            state_.reset();
+        } catch (...) {
+            terminateForShutdownTimeout();
+        }
+    }
+
+    ~PlaybackReaderLifetimeGuard() noexcept
+    {
+        disarm();
+    }
+
+private:
+    shared_ptr<PlaybackControlLifetimeState> state_;
+};
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Data buffers – filled from callbacks, consumed by sync_packages
@@ -182,7 +368,6 @@ static vector<PointVector> Nearest_Points;
 static vector<vector<float>> Nearest_Point_Distances;
 static vector<uint8_t> point_selected_surf;
 static vector<double> res_last;
-static MapAccumulator full_map_accumulator;
 static int effct_feat_num = 0;
 static int feats_down_size = 0;
 static bool flg_EKF_inited = false;
@@ -333,9 +518,16 @@ static void pushLidarFrame(PointCloudXYZI::Ptr cloud, double timestamp)
         if (replay_backpressure_stop.load() || g_exit_flag.load()) {
             return;
         }
+    } else {
+        while (lidar_buffer.size() >= MAX_LIVE_LIDAR_QUEUE) {
+            lidar_buffer.pop_front();
+            if (!time_buffer.empty()) time_buffer.pop_front();
+            input_lidar_frames_dropped.fetch_add(1);
+        }
     }
     lidar_buffer.push_back(cloud);
     time_buffer.push_back(timestamp);
+    updateAtomicHighWater(input_lidar_queue_high_water, lidar_buffer.size());
     sig_buffer.notify_one();
 }
 
@@ -349,10 +541,16 @@ static void pushImuSample(const ImuData &imu)
         lock_guard<mutex> lock(mtx_buffer);
         if (last_timestamp_imu > 0.0 && imu.timestamp < last_timestamp_imu)
         {
+            input_imu_samples_dropped.fetch_add(imu_buffer.size());
             imu_buffer.clear();
         }
         last_timestamp_imu = imu.timestamp;
+        while (imu_buffer.size() >= MAX_IMU_QUEUE) {
+            imu_buffer.pop_front();
+            input_imu_samples_dropped.fetch_add(1);
+        }
         imu_buffer.push_back(ImuDataConstPtr(p));
+        updateAtomicHighWater(input_imu_queue_high_water, imu_buffer.size());
     }
     sig_buffer.notify_one();
 }
@@ -903,16 +1101,27 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     dense_publish_en       = config.dense_publish_en;
     path_en                = config.path_en;
     scan_bodyframe_pub_en  = config.scan_bodyframe_pub_en;
-    publish_full_map       = config.publish_full_map;
+    const bool full_map_mode =
+        config.map_output_mode == "full_async" ||
+        config.map_output_mode == "hybrid";
+    const bool tiled_mode =
+        config.map_output_mode == "tiled_incremental" ||
+        config.map_output_mode == "hybrid";
+    // The grouped mode is authoritative. The legacy publish flags are mapped
+    // into map_output.mode by YamlConfig before execution reaches this point.
+    publish_full_map       = full_map_mode;
+    publish_map_delta      = tiled_mode;
+    const bool map_pipeline_enabled = publish_full_map || publish_map_delta;
     async_full_map_publish = config.async_full_map_publish;
     bag_full_map_periodic  = config.bag_full_map_periodic;
-    publish_map_delta      = config.publish_map_delta;
-    full_map_publish_interval_ms = max(100, config.full_map_publish_interval_ms);
-    full_map_voxel_size = config.full_map_voxel_size > 0.0
-        ? max(filter_size_map_min, config.full_map_voxel_size)
+    const bool periodic_full_map_enabled = publish_full_map;
+    full_map_publish_interval_ms = max(
+        100, config.map_output_full_publish_interval_ms);
+    full_map_voxel_size = config.map_output_full_voxel_leaf_m > 0.0
+        ? max(filter_size_map_min, config.map_output_full_voxel_leaf_m)
         : filter_size_map_min;
     map_delta_max_pending_points = static_cast<size_t>(
-        max(1000, config.map_delta_max_pending_points));
+        max(1000, config.map_output_max_points_per_update));
     // Foxglove uses broadcast time as its live playback clock. Keep it near the
     // lidar frame rate so odometry/TF motion remains smooth; disconnect
     // protection comes from avoiding repeated PlaybackState broadcasts and
@@ -920,17 +1129,33 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     foxglove_control_interval_ms = max(10, config.foxglove_control_interval_ms);
     foxglove_backlog_size = static_cast<size_t>(
         max(8, config.foxglove_backlog_size));
+    foxglove_cloud_interval_ms = max(
+        1, static_cast<int>(lround(1000.0 /
+            max(0.1, config.foxglove_current_cloud_publish_hz))));
+    foxglove_path_interval_ms = max(
+        1, static_cast<int>(lround(1000.0 /
+            max(0.1, config.foxglove_path_publish_hz))));
+    const size_t bag_path_max_points = static_cast<size_t>(
+        max(1, config.storage_path_max_points));
     root_dir               = resolveOutputRoot(config.root_dir);
     replay_backpressure_enabled = use_lvx || use_bag;
     replay_backpressure_stop = false;
+    path_vec.clear();
+    {
+        lock_guard<mutex> lock(mtx_buffer);
+        lidar_buffer.clear();
+        time_buffer.clear();
+        imu_buffer.clear();
+        last_timestamp_imu = -1.0;
+    }
+    input_lidar_frames_dropped = 0;
+    input_imu_samples_dropped = 0;
+    input_lidar_queue_high_water = 0;
+    input_imu_queue_high_water = 0;
+    if (use_bag) path_vec.reserve(min<size_t>(bag_path_max_points, 10000));
 
     // ── Initialise ikd-Tree ──────────────────────────────────────────
     ikdtree.set_downsample_param(static_cast<float>(filter_size_map_min));
-    full_map_accumulator.clear();
-    // Keep the high-resolution ikd-Tree independent from the visualization
-    // accumulator. A 0.05 m global output map grows too quickly for periodic
-    // full snapshots and WebSocket delivery.
-    full_map_accumulator.setLeafSize(static_cast<float>(full_map_voxel_size));
 
     // ── Initialise preprocessor ──────────────────────────────────────
     p_pre.set(config.feature_enabled, config.lidar_type, config.blind, config.point_filter_num);
@@ -988,6 +1213,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                         << full_map_voxel_size << '\n'
                         << "bag_full_map_periodic="
                         << (bag_full_map_periodic ? "true" : "false") << '\n'
+                        << "map_output_mode=" << config.map_output_mode << '\n'
+                        << "publish_full_map="
+                        << (publish_full_map ? "true" : "false") << '\n'
                         << "publish_map_delta="
                         << (publish_map_delta ? "true" : "false") << '\n'
                         << "map_delta_max_pending_points="
@@ -995,48 +1223,170 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                         << "foxglove_control_interval_ms="
                         << foxglove_control_interval_ms << '\n'
                         << "foxglove_backlog_size="
-                        << foxglove_backlog_size << '\n';
+                        << foxglove_backlog_size << '\n'
+                        << "storage_path_max_points="
+                        << bag_path_max_points << '\n';
             runtime_log.flush();
         }
     }
 
-    // ── Foxglove publisher ───────────────────────────────────────────
+    // ── Independent output consumers ──────────────────────────────────
     FoxglovePublisher foxglove;
-    unique_ptr<AsyncMapPublisher> async_map_publisher;
-    // ── Bag writer (only in bag mode) ─────────────────────────────────
-    unique_ptr<BagWriter> bag_writer;
-    if (use_bag) {
-        bag_writer = make_unique<BagWriter>();
-        // Output bag path: same as input but with _output suffix
-        string output_bag = bag_path;
-        auto dot_pos = output_bag.rfind('.');
-        if (dot_pos != string::npos)
-            output_bag = output_bag.substr(0, dot_pos) + "_output.bag";
-        else
-            output_bag += "_output.bag";
-
-        if (!bag_writer->open(output_bag)) {
-            cerr << "[LaserMapping] Failed to open output bag: " << output_bag << endl;
-        } else {
-            bag_writer->addConnection("/odometry", "geometry_msgs/PoseStamped",
-                ros_msg_defs::POSE_STAMPED_MD5, ros_msg_defs::POSE_STAMPED);
-            bag_writer->addConnection(kFastLioRegisteredCloudTopic, "sensor_msgs/PointCloud2",
-                ros_msg_defs::POINT_CLOUD2_MD5, ros_msg_defs::POINT_CLOUD2);
-            bag_writer->addConnection(kFastLioMapTopic, "sensor_msgs/PointCloud2",
-                ros_msg_defs::POINT_CLOUD2_MD5, ros_msg_defs::POINT_CLOUD2);
-            bag_writer->addConnection("/path", "geometry_msgs/PoseArray",
-                ros_msg_defs::POSE_ARRAY_MD5, ros_msg_defs::POSE_ARRAY);
-            bag_writer->addConnection("/tf", "tf2_msgs/TFMessage",
-                ros_msg_defs::TF_MESSAGE_MD5, ros_msg_defs::TF_MESSAGE);
-            cout << "[LaserMapping] Bag writer opened: " << output_bag << endl;
+    RealtimeFoxgloveWorker::Callbacks realtime_callbacks;
+    realtime_callbacks.imu = [&foxglove](const ImuData& imu) {
+        if (foxglove.getClientCount() > 0) foxglove.publishImu(imu);
+    };
+    realtime_callbacks.pose = [&foxglove](
+        const V3D& position, const Eigen::Quaterniond& orientation,
+        double timestamp) {
+        if (foxglove.getClientCount() > 0) {
+            foxglove.publishOdometry(position, orientation, timestamp);
+            foxglove.publishTransform(position, orientation, kFastLioMapFrame,
+                                      kFastLioBodyFrame, timestamp);
+        }
+    };
+    realtime_callbacks.cloud = [&foxglove](
+        const PointCloudXYZI& cloud, double timestamp) {
+        if (foxglove.getClientCount() > 0) {
+            foxglove.publishPointCloud(cloud, timestamp);
+        }
+    };
+    realtime_callbacks.path = [&foxglove](
+        const vector<V3D>& path, double timestamp) {
+        if (foxglove.getClientCount() > 0) {
+            foxglove.publishPath(path, timestamp);
+        }
+    };
+    realtime_callbacks.time = [&foxglove](double timestamp) {
+        if (foxglove.getClientCount() > 0) foxglove.broadcastTime(timestamp);
+    };
+    realtime_callbacks.playback = [&foxglove](
+        const FoxglovePublisher::PlaybackState& state) {
+        if (foxglove.getClientCount() > 0) {
+            foxglove.broadcastPlaybackState(state);
+        }
+    };
+    RealtimeFoxgloveWorker realtime_foxglove(
+        std::move(realtime_callbacks));
+    unique_ptr<StorageWorker> storage_worker;
+    if (use_bag || pcd_save_en) {
+        StorageWorker::Config storage_config;
+        storage_config.mode = StorageWorker::parseMode(config.storage_mode);
+        storage_config.queue_max_bytes = static_cast<size_t>(
+            max(1, config.storage_queue_max_mb)) * 1024ULL * 1024ULL;
+        storage_config.bag_path_publish_hz =
+            max(0.0, config.storage_bag_path_publish_hz);
+        storage_config.pcd_format =
+            StorageWorker::parsePcdFormat(config.storage_pcd_format);
+        storage_config.pcd_chunk_points = static_cast<size_t>(
+            max(1000, config.storage_pcd_chunk_points));
+        storage_config.pcd_chunk_frames = static_cast<size_t>(
+            max(0, config.storage_pcd_chunk_frames));
+        storage_config.output_root = root_dir;
+        storage_config.enable_pcd = pcd_save_en;
+        if (use_bag) {
+            storage_config.bag_path = bag_path;
+            const auto dot_pos = storage_config.bag_path.rfind('.');
+            if (dot_pos != string::npos) {
+                storage_config.bag_path =
+                    storage_config.bag_path.substr(0, dot_pos) + "_output.bag";
+            } else {
+                storage_config.bag_path += "_output.bag";
+            }
+        }
+        storage_worker = make_unique<StorageWorker>(std::move(storage_config));
+        if (!storage_worker->startFor(chrono::seconds(30))) {
+            cerr << "[LaserMapping] Storage worker failed to start; SLAM will continue."
+                 << endl;
         }
     }
 
-    // ── Data source setup ────────────────────────────────────────────
-    unique_ptr<LvxReader>    lvx_reader;
-    unique_ptr<LivoxAdapter> livox_adapter;
-    unique_ptr<BagReader>    bag_reader;
+    atomic<bool> final_bag_map_requested{false};
+    unique_ptr<MapBuildWorker> async_map_publisher;
+    if (map_pipeline_enabled) {
+        MapBuildWorker::Config map_config;
+        map_config.full_voxel_leaf_m = full_map_voxel_size;
+        map_config.store.tile_size_m = max(1.0, config.map_output_tile_size_m);
+        map_config.store.voxel_leaf_m = max(
+            0.001, config.map_output_tile_voxel_leaf_m);
+        map_config.store.update_policy = TiledMapStore::parseUpdatePolicy(
+            config.map_output_voxel_update_policy);
+        map_config.store.max_memory_bytes = static_cast<size_t>(
+            max(1, config.map_output_max_memory_mb)) * 1024ULL * 1024ULL;
+        map_config.store.memory_policy = TiledMapStore::parseMemoryPolicy(
+            config.map_output_memory_policy);
+        map_config.input_queue_capacity = static_cast<size_t>(
+            max(1, config.map_output_input_queue_capacity));
+        map_config.input_queue_max_bytes = static_cast<size_t>(
+            max(1, config.map_output_input_queue_max_mb)) * 1024ULL * 1024ULL;
+        map_config.input_queue_max_points =
+            map_config.input_queue_max_bytes / sizeof(PointType);
+        map_config.max_tiles_per_update = static_cast<size_t>(
+            max(1, config.map_output_max_tiles_per_update));
+        map_config.max_points_per_update = static_cast<size_t>(
+            max(1000, config.map_output_max_points_per_update));
+        map_config.max_bytes_per_update =
+            map_config.max_points_per_update * 256ULL;
+        if (publish_map_delta) {
+            const size_t max_tile_voxels_by_bytes =
+                TileUpdate::maxPointCountForBytes(map_config.max_bytes_per_update);
+            map_config.store.max_voxels_per_tile = std::min(
+                map_config.max_points_per_update, max_tile_voxels_by_bytes);
+        }
+        // A compatibility /map snapshot may be as large as the bounded store.
+        // Pure Tile mode never reserves that extra full-map capacity.
+        map_config.output.max_pending_bytes = publish_full_map
+            ? map_config.store.max_memory_bytes + map_config.max_bytes_per_update
+            : map_config.max_bytes_per_update;
+        map_config.output.max_pending_points =
+            map_config.output.max_pending_bytes / sizeof(PointType);
+        map_config.output.tile_publish_hz = static_cast<double>(
+            max(1, config.map_output_tile_publish_hz));
 
+        async_map_publisher = make_unique<MapBuildWorker>(
+            std::move(map_config),
+            publish_full_map
+                ? MapBuildWorker::PublishCallback{
+                      [&foxglove, &storage_worker, &final_bag_map_requested]
+                      (PointCloudXYZI const& map, double timestamp) {
+                          const bool write_final =
+                              final_bag_map_requested.exchange(false);
+                          if (storage_worker && storage_worker->isBagOpen() &&
+                              (bag_full_map_periodic || write_final))
+                          {
+                              const bool accepted = storage_worker->enqueueCloud(
+                                  doubleToNs(timestamp), PointCloudXYZI(map),
+                                  kFastLioMapFrame, kFastLioMapTopic);
+                              if (write_final && !accepted) {
+                                  final_bag_map_requested = true;
+                                  cerr << "[LaserMapping] Final Bag map was rejected by the "
+                                          "bounded storage queue." << endl;
+                              }
+                          }
+                          if (foxglove.getClientCount() > 0) {
+                              foxglove.publishMap(map, timestamp);
+                          }
+                      }}
+                : MapBuildWorker::PublishCallback{},
+            publish_map_delta
+                ? MapBuildWorker::TilePublishCallback{
+                      [&foxglove, &config](const TileUpdate& tile, double timestamp) {
+                           if (foxglove.getClientCount() > 0) {
+                              foxglove.publishMapTile(
+                                  tile, config.map_output_tile_voxel_leaf_m,
+                                  timestamp);
+                          }
+                      }}
+                : MapBuildWorker::TilePublishCallback{});
+        async_map_publisher->start();
+        cout << "[LaserMapping] Bounded asynchronous map pipeline enabled."
+             << " mode=" << config.map_output_mode
+             << " tile=" << config.map_output_tile_size_m << " m"
+             << " voxel=" << config.map_output_tile_voxel_leaf_m << " m"
+             << " input_queue=" << config.map_output_input_queue_capacity << endl;
+    }
+
+    // ── Data source setup ────────────────────────────────────────────
     // Shared storage for real-time adapter point accumulation
     vector<LvxPoint>    adapter_accum_points;
     double              adapter_accum_time = 0.0;
@@ -1044,22 +1394,76 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     const double        ACCUM_FRAME_SEC = max(0.01, config.realtime_frame_sec);
     const size_t        ACCUM_POINT_THRESHOLD =
         static_cast<size_t>(max(1000, config.realtime_frame_points));
-    atomic<uint64_t>    playback_current_time_ns{0};
-    atomic<double>      playback_speed{1.0};
-    atomic<bool>        playback_paused{false};
-    atomic<bool>        playback_pause_drain_pending{false};
+    auto playback_control_state =
+        make_shared<PlaybackControlLifetimeState>();
 
+    // Declare producers after every object captured by their callbacks. C++
+    // destroys locals in reverse order, so this is a final safety net in
+    // addition to the explicit stopFor() barrier below.
+    unique_ptr<LvxReader>    lvx_reader;
+    unique_ptr<LivoxAdapter> livox_adapter;
+    unique_ptr<BagReader>    bag_reader;
+    PlaybackReaderLifetimeGuard playback_reader_lifetime(
+        playback_control_state);
+
+    const auto stop_initialization_workers = [&]() noexcept {
+        try {
+            replay_backpressure_stop = true;
+            sig_buffer.notify_all();
+            playback_reader_lifetime.disarm();
+            const auto deadline =
+                chrono::steady_clock::now() + chrono::seconds(30);
+            const auto remaining = [&]() {
+                const auto now = chrono::steady_clock::now();
+                if (now >= deadline) return chrono::milliseconds(0);
+                return chrono::duration_cast<chrono::milliseconds>(
+                    deadline - now);
+            };
+            const auto slice = [&](chrono::milliseconds maximum) {
+                return min(remaining(), maximum);
+            };
+            if (lvx_reader &&
+                !lvx_reader->stopFor(slice(chrono::seconds(5)))) {
+                terminateForShutdownTimeout();
+            }
+            if (livox_adapter &&
+                !livox_adapter->stopFor(slice(chrono::seconds(5)))) {
+                terminateForShutdownTimeout();
+            }
+            if (bag_reader &&
+                !bag_reader->stopFor(slice(chrono::seconds(5)))) {
+                terminateForShutdownTimeout();
+            }
+            if (async_map_publisher &&
+                !async_map_publisher->stopFor(
+                    slice(chrono::seconds(10)), false)) {
+                terminateForShutdownTimeout();
+            }
+            if (storage_worker &&
+                !storage_worker->stopFor(
+                    slice(chrono::seconds(10)), false)) {
+                terminateForShutdownTimeout();
+            }
+        } catch (...) {
+            terminateForShutdownTimeout();
+        }
+    };
+
+    try
+    {
     if (use_lvx)
     {
         lvx_reader = make_unique<LvxReader>();
         if (!lvx_reader->open(lvx_path))
         {
+            stop_initialization_workers();
             cerr << "[LaserMapping] Cannot open lvx file: " << lvx_path << endl;
             return;
         }
+        playback_reader_lifetime.setLvxReader(lvx_reader.get());
 
         lvx_reader->setFrameCallback(
-            [&foxglove](const vector<LvxPoint> &points,
+            [&realtime_foxglove, &foxglove](const vector<LvxPoint> &points,
                const vector<ImuData> &imus,
                double timestamp)
             {
@@ -1069,7 +1473,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                     pushLidarFrame(cloud, timestamp);
 
                 for (auto &imu : imus) {
-                    foxglove.publishImu(imu);
+                    if (foxglove.getClientCount() > 0) {
+                        realtime_foxglove.tryEnqueueImu(imu);
+                    }
                     pushImuSample(imu);
                 }
             });
@@ -1080,12 +1486,14 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         bag_reader = make_unique<BagReader>();
         if (!bag_reader->open(bag_path))
         {
+            stop_initialization_workers();
             cerr << "[LaserMapping] Cannot open bag file: " << bag_path << endl;
             return;
         }
+        playback_reader_lifetime.setBagReader(bag_reader.get());
 
         bag_reader->setFrameCallback(
-            [&foxglove](const vector<LvxPoint> &points,
+            [&realtime_foxglove, &foxglove](const vector<LvxPoint> &points,
                const vector<ImuData> &imus,
                double timestamp)
             {
@@ -1095,7 +1503,9 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                         pushLidarFrame(cloud, timestamp);
                 }
                 for (auto &imu : imus) {
-                    foxglove.publishImu(imu);
+                    if (foxglove.getClientCount() > 0) {
+                        realtime_foxglove.tryEnqueueImu(imu);
+                    }
                     pushImuSample(imu);
                 }
             });
@@ -1104,12 +1514,6 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     else
     {
         livox_adapter = make_unique<LivoxAdapter>();
-        if (!livox_adapter->init())
-        {
-            cerr << "[LaserMapping] LivoxAdapter init failed." << endl;
-            return;
-        }
-
         livox_adapter->setLidarCallback(
             [&adapter_accum_points, &adapter_accum_time, &adapter_accum_mtx,
              ACCUM_FRAME_SEC, ACCUM_POINT_THRESHOLD]
@@ -1157,42 +1561,71 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             });
 
         livox_adapter->setImuCallback(
-            [&foxglove](const ImuData &imu) {
-                foxglove.publishImu(imu);
+            [&realtime_foxglove, &foxglove](const ImuData &imu) {
+                if (foxglove.getClientCount() > 0) {
+                    realtime_foxglove.tryEnqueueImu(imu);
+                }
                 pushImuSample(imu);
             });
+
+        if (!livox_adapter->init())
+        {
+            stop_initialization_workers();
+            cerr << "[LaserMapping] LivoxAdapter init failed." << endl;
+            return;
+        }
 
     }
 
     // ── State & covariance init ──────────────────────────────────────
+    }
+    catch (...)
+    {
+        stop_initialization_workers();
+        throw;
+    }
+
     if (use_lvx && lvx_reader)
     {
         const uint64_t end_ns = std::max<uint64_t>(lvx_reader->getDurationNs(), 1);
         foxglove.setPlaybackControl(
             0, end_ns,
-            [&](const FoxglovePublisher::PlaybackControlRequest& request) {
+            [playback_control_state]
+            (const FoxglovePublisher::PlaybackControlRequest& request) {
+                lock_guard<mutex> reader_lock(
+                    playback_control_state->reader_mutex);
+                LvxReader* reader = playback_control_state->lvx_reader;
+                if (!reader) {
+                    return FoxglovePublisher::PlaybackState{
+                        FoxglovePublisher::PlaybackStatus::Ended,
+                        playback_control_state->current_time_ns.load(),
+                        static_cast<float>(
+                            playback_control_state->speed.load()),
+                        false};
+                }
                 const double speed = request.speed > 0.0f ? request.speed : 1.0f;
-                playback_speed = speed;
-                lvx_reader->setSpeed(speed);
+                playback_control_state->speed = speed;
+                reader->setSpeed(speed);
 
                 if (request.seek_time_ns) {
                     // Seek is temporarily disabled because Foxglove clears the rendered map on seek.
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
-                    lvx_reader->pause();
-                    if (!playback_paused.exchange(true)) {
-                        playback_pause_drain_pending = true;
+                    reader->pause();
+                    if (!playback_control_state->paused.exchange(true)) {
+                        playback_control_state->pause_drain_pending = true;
                     }
                 } else {
-                    lvx_reader->resume();
-                    playback_paused = false;
-                    playback_pause_drain_pending = false;
+                    reader->resume();
+                    playback_control_state->paused = false;
+                    playback_control_state->pause_drain_pending = false;
                 }
 
                 return FoxglovePublisher::PlaybackState{
-                    playback_paused ? FoxglovePublisher::PlaybackStatus::Paused
-                                    : FoxglovePublisher::PlaybackStatus::Playing,
-                    playback_current_time_ns.load(),
-                    static_cast<float>(playback_speed.load()),
+                    playback_control_state->paused
+                        ? FoxglovePublisher::PlaybackStatus::Paused
+                        : FoxglovePublisher::PlaybackStatus::Playing,
+                    playback_control_state->current_time_ns.load(),
+                    static_cast<float>(playback_control_state->speed.load()),
                     false};
             });
     }
@@ -1200,29 +1633,42 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     {
         foxglove.setPlaybackControl(
             bag_reader->getStartTimeNs(), bag_reader->getEndTimeNs(),
-            [&](const FoxglovePublisher::PlaybackControlRequest& request) {
+            [playback_control_state]
+            (const FoxglovePublisher::PlaybackControlRequest& request) {
+                lock_guard<mutex> reader_lock(
+                    playback_control_state->reader_mutex);
+                BagReader* reader = playback_control_state->bag_reader;
+                if (!reader) {
+                    return FoxglovePublisher::PlaybackState{
+                        FoxglovePublisher::PlaybackStatus::Ended,
+                        playback_control_state->current_time_ns.load(),
+                        static_cast<float>(
+                            playback_control_state->speed.load()),
+                        false};
+                }
                 const double speed = request.speed > 0.0f ? request.speed : 1.0f;
-                playback_speed = speed;
-                bag_reader->setSpeed(speed);
+                playback_control_state->speed = speed;
+                reader->setSpeed(speed);
 
                 if (request.seek_time_ns) {
                     // Seek is temporarily disabled because Foxglove clears the rendered map on seek.
                 } else if (request.command == FoxglovePublisher::PlaybackCommand::Pause) {
-                    bag_reader->pause();
-                    if (!playback_paused.exchange(true)) {
-                        playback_pause_drain_pending = true;
+                    reader->pause();
+                    if (!playback_control_state->paused.exchange(true)) {
+                        playback_control_state->pause_drain_pending = true;
                     }
                 } else {
-                    bag_reader->resume();
-                    playback_paused = false;
-                    playback_pause_drain_pending = false;
+                    reader->resume();
+                    playback_control_state->paused = false;
+                    playback_control_state->pause_drain_pending = false;
                 }
 
                 return FoxglovePublisher::PlaybackState{
-                    playback_paused ? FoxglovePublisher::PlaybackStatus::Paused
-                                    : FoxglovePublisher::PlaybackStatus::Playing,
-                    playback_current_time_ns.load(),
-                    static_cast<float>(playback_speed.load()),
+                    playback_control_state->paused
+                        ? FoxglovePublisher::PlaybackStatus::Paused
+                        : FoxglovePublisher::PlaybackStatus::Playing,
+                    playback_control_state->current_time_ns.load(),
+                    static_cast<float>(playback_control_state->speed.load()),
                     false};
             });
     }
@@ -1233,66 +1679,41 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     }
     else
     {
+        realtime_foxglove.start();
         cout << "[LaserMapping] Foxglove WebSocket: ws://localhost:"
              << foxglove.getPort() << endl;
 
-        if (publish_full_map && (async_full_map_publish || publish_map_delta)) {
-            async_map_publisher = make_unique<AsyncMapPublisher>(
-                full_map_accumulator,
-                [&foxglove](const PointCloudXYZI& map, double timestamp) {
-                    if (foxglove.isRunning()) {
-                        foxglove.publishMap(map, timestamp);
-                    }
-                },
-                publish_map_delta
-                    ? AsyncMapPublisher::PublishCallback{
-                          [&foxglove](const PointCloudXYZI& delta, double timestamp) {
-                              if (foxglove.isRunning()) {
-                                  foxglove.publishMapDelta(delta, timestamp);
-                              }
-                          }}
-                    : AsyncMapPublisher::PublishCallback{},
-                map_delta_max_pending_points);
-            async_map_publisher->start();
-            if (async_full_map_publish) {
-                cout << "[LaserMapping] Asynchronous full-map build and publishing enabled."
-                     << " output_voxel=" << full_map_voxel_size << " m"
-                     << ", backlog=" << foxglove_backlog_size << endl;
-            }
-            if (publish_map_delta) {
-                cout << "[LaserMapping] Incremental map topic enabled: "
-                     << kFastLioMapDeltaTopic << endl;
-            }
+        if (publish_map_delta) {
+            cout << "[LaserMapping] Persistent tiled Scene topic enabled: "
+                 << kFastLioMapTilesTopic << endl;
         }
     }
 
-    uint64_t last_playback_client_generation =
-        foxglove.getClientConnectionGeneration();
+    // Start at zero so a client that connects immediately after server start
+    // still triggers the same full/tile resynchronization as a later reconnect.
+    uint64_t last_playback_client_generation = 0;
+
     if (use_lvx && lvx_reader)
     {
-        lvx_reader->play(playback_speed.load());
-        if (foxglove.isRunning()) {
-            foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+        lvx_reader->play(playback_control_state->speed.load());
+        if (foxglove.getClientCount() > 0) {
+            realtime_foxglove.tryEnqueuePlayback(FoxglovePublisher::PlaybackState{
                 FoxglovePublisher::PlaybackStatus::Playing,
-                playback_current_time_ns.load(),
-                static_cast<float>(playback_speed.load()),
+                playback_control_state->current_time_ns.load(),
+                static_cast<float>(playback_control_state->speed.load()),
                 false});
-            last_playback_client_generation =
-                foxglove.getClientConnectionGeneration();
         }
         cout << "[LaserMapping] LVX playback started." << endl;
     }
     else if (use_bag && bag_reader)
     {
-        bag_reader->play(playback_speed.load());
-        if (foxglove.isRunning()) {
-            foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+        bag_reader->play(playback_control_state->speed.load());
+        if (foxglove.getClientCount() > 0) {
+            realtime_foxglove.tryEnqueuePlayback(FoxglovePublisher::PlaybackState{
                 FoxglovePublisher::PlaybackStatus::Playing,
-                playback_current_time_ns.load(),
-                static_cast<float>(playback_speed.load()),
+                playback_control_state->current_time_ns.load(),
+                static_cast<float>(playback_control_state->speed.load()),
                 false});
-            last_playback_client_generation =
-                foxglove.getClientConnectionGeneration();
         }
         cout << "[LaserMapping] Bag playback started." << endl;
     }
@@ -1328,20 +1749,23 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
     // ── Timing & bookkeeping ─────────────────────────────────────────
     int  frame_id = 0;
+    uint64_t bag_path_points_trimmed = 0;
     double T1, T2, s_plot, s_plot2, s_plot3, s_plot4, s_plot5, s_plot6;
     const auto foxglove_publish_start = chrono::steady_clock::now();
     auto last_foxglove_cloud_pub =
-        foxglove_publish_start - chrono::milliseconds(FOXGLOVE_CLOUD_INTERVAL_MS);
+        foxglove_publish_start - chrono::milliseconds(foxglove_cloud_interval_ms);
     auto last_foxglove_map_pub =
         foxglove_publish_start - chrono::milliseconds(
-            publish_full_map ? full_map_publish_interval_ms : FOXGLOVE_MAP_INTERVAL_MS);
+            full_map_publish_interval_ms);
     auto last_foxglove_path_pub =
-        foxglove_publish_start - chrono::milliseconds(FOXGLOVE_PATH_INTERVAL_MS);
+        foxglove_publish_start - chrono::milliseconds(foxglove_path_interval_ms);
     auto last_foxglove_control_pub =
         foxglove_publish_start - chrono::milliseconds(foxglove_control_interval_ms);
-
-    // PCD accumulation cloud
-    PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+    size_t process_rss_bytes = currentProcessRssBytes();
+    size_t process_peak_rss_bytes = process_rss_bytes;
+    BoundedTimingWindow<> map_accumulate_timing;
+    BoundedTimingWindow<> map_schedule_timing;
+    bool input_failure_reported = false;
 
     // Ensure PCD directory exists
     {
@@ -1359,33 +1783,102 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ══════════════════════════════════════════════════════════════════
     while (!g_exit_flag.load())
     {
-        // Foxglove initially renders a paused-looking play button until it
-        // receives a playback state. Re-announce only for a newly connected
-        // client, including reconnects, instead of flooding the control queue.
-        if ((use_lvx || use_bag) && foxglove.isRunning()) {
+        // A new client needs control state and a map resync.  This also covers
+        // live Livox input, where there is no playback state to announce.
+        if (foxglove.isRunning()) {
             const uint64_t client_generation =
                 foxglove.getClientConnectionGeneration();
-            if (client_generation != last_playback_client_generation) {
+            if (client_generation != last_playback_client_generation &&
+                foxglove.getClientCount() > 0) {
                 last_playback_client_generation = client_generation;
-                foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
-                    playback_paused.load()
-                        ? FoxglovePublisher::PlaybackStatus::Paused
-                        : FoxglovePublisher::PlaybackStatus::Playing,
-                    playback_current_time_ns.load(),
-                    static_cast<float>(playback_speed.load()),
-                    false});
+                if (use_lvx || use_bag) {
+                    realtime_foxglove.tryEnqueuePlayback(
+                        FoxglovePublisher::PlaybackState{
+                        playback_control_state->paused.load()
+                            ? FoxglovePublisher::PlaybackStatus::Paused
+                            : FoxglovePublisher::PlaybackStatus::Playing,
+                        playback_control_state->current_time_ns.load(),
+                        static_cast<float>(
+                            playback_control_state->speed.load()),
+                        false});
+                }
+                if (async_map_publisher && async_map_publisher->isRunning()) {
+                    if (publish_full_map) {
+                        async_map_publisher->request(
+                            static_cast<double>(
+                                playback_control_state->current_time_ns.load()) /
+                                1e9);
+                    }
+                    if (publish_map_delta) {
+                        async_map_publisher->requestTileResync();
+                    }
+                }
             }
         }
 
         // Check EOF for lvx/bag — but only exit after all buffered data is processed
-        if ((use_lvx || use_bag) && playback_paused.load())
+        const bool lvx_eof = use_lvx && lvx_reader && lvx_reader->isEOF();
+        const bool bag_eof = use_bag && bag_reader && bag_reader->isEOF();
+        const bool lvx_failed =
+            use_lvx && lvx_reader && lvx_reader->hasPlaybackFailure();
+        const bool bag_failed =
+            use_bag && bag_reader && bag_reader->hasPlaybackFailure();
+        const bool livox_failed =
+            livox_adapter && livox_adapter->hasCallbackFailure();
+        const bool lvx_terminal = isPlaybackTerminal(lvx_eof, lvx_failed);
+        const bool bag_terminal = isPlaybackTerminal(bag_eof, bag_failed);
+        const bool playback_terminal = lvx_terminal || bag_terminal;
+
+        if ((lvx_failed || bag_failed || livox_failed) &&
+            !input_failure_reported)
         {
-            if (playback_pause_drain_pending.exchange(false) &&
+            const char* source =
+                lvx_failed ? "lvx" : (bag_failed ? "bag" : "livox");
+            uint64_t failure_count = 0;
+            string error = "sdk_callback_exception";
+            try {
+                if (lvx_failed) {
+                    const auto stats = lvx_reader->playbackStats();
+                    failure_count = stats.failures;
+                    error = stats.last_error;
+                } else if (bag_failed) {
+                    const auto stats = bag_reader->playbackStats();
+                    failure_count = stats.failures;
+                    error = stats.last_error;
+                } else {
+                    failure_count = livox_adapter->callbackFailureCount();
+                }
+                error = sanitizePlaybackErrorForLog(error);
+            } catch (...) {
+                error = "failure_snapshot_unavailable";
+            }
+
+            ostringstream failure_log;
+            failure_log << "event=playback_failed"
+                        << " source=" << source
+                        << " failures=" << failure_count
+                        << " error=" << error;
+            writeRuntimeLog(failure_log.str());
+            cerr << "[LaserMapping] Input producer failed: source="
+                 << source << " error=" << error << endl;
+            input_failure_reported = true;
+        }
+
+        // Live input has no finite tail to drain. Once its callback fuse
+        // trips, enter the same bounded shutdown path immediately.
+        if (livox_failed) break;
+
+        if (!playback_terminal && (use_lvx || use_bag) &&
+            playback_control_state->paused.load())
+        {
+            if (playback_control_state->pause_drain_pending.exchange(false) &&
                 async_map_publisher && async_map_publisher->isRunning())
             {
-                if (publish_full_map && foxglove.isRunning()) {
+                if (publish_full_map && foxglove.getClientCount() > 0) {
                     async_map_publisher->request(
-                        static_cast<double>(playback_current_time_ns.load()) / 1e9);
+                        static_cast<double>(
+                            playback_control_state->current_time_ns.load()) /
+                            1e9);
                 }
                 async_map_publisher->flush();
             }
@@ -1394,21 +1887,90 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             continue;
         }
 
-        if (use_lvx && lvx_reader && lvx_reader->isEOF())
+        if (playback_terminal)
         {
-            lock_guard<mutex> lock(mtx_buffer);
-            if (lidar_buffer.empty())
+            size_t tail_frames_dropped = 0;
+            size_t tail_imu_remaining = 0;
+            double tail_lidar_end = 0.0;
+            double tail_last_imu = 0.0;
+            string tail_drop_reason;
+            bool playback_finished = false;
+            bool drop_only_front_frame = false;
             {
-                cout << "[LaserMapping] LVX playback finished (EOF)." << endl;
-                break;
+                lock_guard<mutex> lock(mtx_buffer);
+                if (lidar_buffer.empty()) {
+                    playback_finished = true;
+                } else if (time_buffer.empty()) {
+                    tail_drop_reason = "missing_lidar_timestamp";
+                } else if (!lidar_buffer.front() ||
+                           lidar_buffer.front()->points.empty()) {
+                    // sync_packages cannot derive an end time for an empty
+                    // cloud, and terminal input guarantees it cannot be repaired.
+                    tail_drop_reason = "empty_lidar_frame";
+                    drop_only_front_frame = true;
+                    tail_frames_dropped = 1;
+                    tail_imu_remaining = imu_buffer.size();
+                    lidar_buffer.pop_front();
+                    time_buffer.pop_front();
+                    playback_finished = lidar_buffer.empty();
+                    sig_buffer.notify_all();
+                } else {
+                    double max_offset_ms = 0.0;
+                    for (const auto& point : lidar_buffer.front()->points) {
+                        max_offset_ms = max(
+                            max_offset_ms,
+                            static_cast<double>(point.curvature));
+                    }
+                    tail_lidar_end =
+                        time_buffer.front() + max_offset_ms / 1000.0;
+                    tail_last_imu = last_timestamp_imu;
+                    tail_imu_remaining = imu_buffer.size();
+                    if (imu_buffer.empty()) {
+                        tail_drop_reason = "no_final_imu";
+                    } else if (!hasImuCoverageForLidarFrame(
+                                   last_timestamp_imu, tail_lidar_end))
+                    {
+                        // No producer can add another IMU sample after a
+                        // terminal reader state.
+                        // Keeping this frame would make sync_packages wait
+                        // forever, so explicitly account for the unusable tail.
+                        tail_drop_reason = "no_final_imu_coverage";
+                    }
+                }
+
+                if (!tail_drop_reason.empty() && !drop_only_front_frame) {
+                    tail_frames_dropped = lidar_buffer.size();
+                    lidar_buffer.clear();
+                    time_buffer.clear();
+                    imu_buffer.clear();
+                    playback_finished = true;
+                    sig_buffer.notify_all();
+                }
             }
-        }
-        if (use_bag && bag_reader && bag_reader->isEOF())
-        {
-            lock_guard<mutex> lock(mtx_buffer);
-            if (lidar_buffer.empty())
-            {
-                cout << "[LaserMapping] Bag playback finished (EOF)." << endl;
+
+            if (!tail_drop_reason.empty()) {
+                ostringstream tail_log;
+                tail_log << fixed << setprecision(6)
+                         << "event=playback_tail_dropped"
+                         << " source=" << (lvx_terminal ? "lvx" : "bag")
+                         << " reason=" << tail_drop_reason
+                         << " lidar_frames=" << tail_frames_dropped
+                         << " imu_samples=" << tail_imu_remaining
+                         << " lidar_end=" << tail_lidar_end
+                         << " last_imu=" << tail_last_imu;
+                writeRuntimeLog(tail_log.str());
+                cerr << "[LaserMapping] Dropped " << tail_frames_dropped
+                     << " unprocessable tail LiDAR frame(s) at terminal input: "
+                     << tail_drop_reason << endl;
+            }
+            if (playback_finished) {
+                const bool failed = lvx_failed || bag_failed;
+                cout << "[LaserMapping] "
+                     << (lvx_terminal ? "LVX" : "Bag")
+                     << (failed
+                             ? " playback stopped after reader failure."
+                             : " playback finished (EOF).")
+                     << endl;
                 break;
             }
         }
@@ -1580,29 +2142,34 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         T1 = chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
         double pub_time = Measures.lidar_end_time;
         const uint64_t pub_time_ns = doubleToNs(pub_time);
-        playback_current_time_ns = pub_time_ns;
-        const bool write_bag_output = (bag_writer && bag_writer->isOpen());
-        const bool publish_foxglove = foxglove.isRunning();
+        playback_control_state->current_time_ns = pub_time_ns;
+        const bool write_bag_output =
+            storage_worker && storage_worker->isBagOpen();
+        const bool publish_foxglove = realtime_foxglove.isRunning() &&
+            foxglove.getClientCount() > 0;
         const auto publish_wall_now = chrono::steady_clock::now();
+        const bool publish_foxglove_cloud =
+            scan_publish_en && publish_foxglove &&
+            chrono::duration_cast<chrono::milliseconds>(
+                publish_wall_now - last_foxglove_cloud_pub).count() >=
+                foxglove_cloud_interval_ms;
 
         // Publish odometry
         V3D pos_v3d(state_point.pos[0], state_point.pos[1], state_point.pos[2]);
 
         if (write_bag_output) {
-            bag_writer->writeOdometry(pub_time_ns, pos_v3d, geoQuat, kFastLioMapFrame);
-            bag_writer->writeTF(pub_time_ns, pos_v3d, geoQuat,
-                                kFastLioMapFrame, kFastLioBodyFrame);
+            storage_worker->enqueueOdometryTf(pub_time_ns, pos_v3d, geoQuat);
         }
         if (publish_foxglove) {
-            foxglove.publishOdometry(pos_v3d, geoQuat, pub_time);
-            foxglove.publishTransform(pos_v3d, geoQuat,
-                                      kFastLioMapFrame, kFastLioBodyFrame, pub_time);
+            realtime_foxglove.tryEnqueuePose(pos_v3d, geoQuat, pub_time);
         }
 
-        // Build world-frame cloud for publishing
-        PointCloudXYZI cloud_world;
-        if (scan_publish_en)
+        // Build the registered cloud only when a consumer needs this frame.
+        // Map accumulation owns its separate sparse world-frame transform.
+        if (scan_publish_en &&
+            (write_bag_output || publish_foxglove_cloud))
         {
+            PointCloudXYZI cloud_world;
             PointCloudXYZI::Ptr publish_cloud =
                 dense_publish_en ? feats_undistort : feats_down_body;
             cloud_world.reserve(publish_cloud->points.size());
@@ -1612,17 +2179,24 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 pointBodyToWorld(&(publish_cloud->points[i]), &pt_world);
                 cloud_world.push_back(pt_world);
             }
+            cloud_world.width =
+                static_cast<uint32_t>(cloud_world.points.size());
+            cloud_world.height = 1;
+            cloud_world.is_dense = true;
             if (write_bag_output) {
-                bag_writer->writePointCloud(pub_time_ns, cloud_world, kFastLioMapFrame,
-                                            kFastLioRegisteredCloudTopic);
+                if (publish_foxglove_cloud) {
+                    storage_worker->enqueueCloud(
+                        pub_time_ns, PointCloudXYZI(cloud_world),
+                        kFastLioMapFrame, kFastLioRegisteredCloudTopic);
+                } else {
+                    storage_worker->enqueueCloud(
+                        pub_time_ns, std::move(cloud_world),
+                        kFastLioMapFrame, kFastLioRegisteredCloudTopic);
+                }
             }
-            const bool publish_foxglove_cloud =
-                publish_foxglove &&
-                chrono::duration_cast<chrono::milliseconds>(
-                    publish_wall_now - last_foxglove_cloud_pub).count() >=
-                    FOXGLOVE_CLOUD_INTERVAL_MS;
             if (publish_foxglove_cloud) {
-                foxglove.publishPointCloud(cloud_world, pub_time);
+                realtime_foxglove.tryEnqueueCloud(
+                    std::move(cloud_world), pub_time);
                 last_foxglove_cloud_pub = publish_wall_now;
             }
         }
@@ -1630,38 +2204,35 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         double map_accumulate_ms = 0.0;
         double map_schedule_ms = 0.0;
         int effective_full_map_interval_ms = full_map_publish_interval_ms;
-        if (publish_full_map) {
+        if (map_pipeline_enabled) {
             const auto map_accumulate_begin = chrono::steady_clock::now();
             PointCloudXYZI map_frame_world;
 
             // The dense registered cloud is intended for visualization only.
             // Reuse the bounded SLAM input for the accumulated map so HD scans
             // do not hash tens of thousands of redundant points on the main thread.
-            if (scan_publish_en && !dense_publish_en && !cloud_world.empty()) {
-                map_frame_world = std::move(cloud_world);
-            } else {
-                map_frame_world.reserve(feats_down_body->points.size());
-                PointType pt_world;
-                for (const auto& point_body : feats_down_body->points) {
-                    pointBodyToWorld(&point_body, &pt_world);
-                    map_frame_world.push_back(pt_world);
-                }
-                map_frame_world.width =
-                    static_cast<uint32_t>(map_frame_world.points.size());
-                map_frame_world.height = 1;
-                map_frame_world.is_dense = true;
+            map_frame_world.reserve(feats_down_body->points.size());
+            PointType pt_world;
+            for (const auto& point_body : feats_down_body->points) {
+                pointBodyToWorld(&point_body, &pt_world);
+                map_frame_world.push_back(pt_world);
             }
+            map_frame_world.width =
+                static_cast<uint32_t>(map_frame_world.points.size());
+            map_frame_world.height = 1;
+            map_frame_world.is_dense = true;
 
-            const bool async_map_build =
-                async_map_publisher && async_map_publisher->isRunning();
-            if (async_map_build) {
+            if (async_map_publisher && async_map_publisher->isRunning()) {
+                PointType current_position;
+                current_position.x = static_cast<float>(state_point.pos(0));
+                current_position.y = static_cast<float>(state_point.pos(1));
+                current_position.z = static_cast<float>(state_point.pos(2));
                 async_map_publisher->enqueueFrame(
-                    std::move(map_frame_world), pub_time);
-            } else {
-                full_map_accumulator.addFrame(map_frame_world);
+                    std::move(map_frame_world), pub_time, &current_position);
             }
             map_accumulate_ms = chrono::duration<double, milli>(
                 chrono::steady_clock::now() - map_accumulate_begin).count();
+            map_accumulate_timing.record(map_accumulate_ms);
         }
 
         const auto map_schedule_begin = chrono::steady_clock::now();
@@ -1669,92 +2240,61 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
             if (async_map_publisher) {
                 const auto timing_stats = async_map_publisher->stats();
                 const double last_full_output_ms =
-                    timing_stats.last_snapshot_ms + timing_stats.last_publish_ms;
+                    timing_stats.last_full_snapshot_ms +
+                    timing_stats.output.last_full_publish_ms;
                 if (last_full_output_ms > 0.0) {
                     effective_full_map_interval_ms = max(
                         full_map_publish_interval_ms,
                         static_cast<int>(ceil(last_full_output_ms * 2.0)));
                 }
             }
-            const bool full_map_due =
+            const bool full_map_due = periodic_full_map_enabled &&
                 chrono::duration_cast<chrono::milliseconds>(
                     publish_wall_now - last_foxglove_map_pub).count() >=
                 effective_full_map_interval_ms;
             const bool async_foxglove_map =
-                publish_foxglove && async_full_map_publish && async_map_publisher &&
+                publish_foxglove && async_map_publisher &&
                 async_map_publisher->isRunning();
-            const bool sync_foxglove_map = publish_foxglove && !async_foxglove_map;
             const bool sync_bag_map = write_bag_output && bag_full_map_periodic;
 
-            if (full_map_due && (async_foxglove_map || sync_foxglove_map || sync_bag_map)) {
-                if (async_foxglove_map) {
+            if (full_map_due && (async_foxglove_map || sync_bag_map)) {
+                if (async_map_publisher && async_map_publisher->isRunning()) {
                     async_map_publisher->request(pub_time);
                 }
-
-                if (sync_foxglove_map || sync_bag_map) {
-                    // An explicitly synchronous consumer must observe all map
-                    // frames queued before this snapshot request.
-                    if (async_map_publisher && async_map_publisher->isRunning()) {
-                        async_map_publisher->flush();
-                    }
-                    PointCloudXYZI map_cloud = full_map_accumulator.snapshot();
-                    if (!map_cloud.empty()) {
-                        if (sync_bag_map) {
-                            bag_writer->writePointCloud(pub_time_ns, map_cloud,
-                                                        kFastLioMapFrame, kFastLioMapTopic);
-                        }
-                        if (sync_foxglove_map) {
-                            foxglove.publishMap(map_cloud, pub_time);
-                        }
-                    }
-                }
                 last_foxglove_map_pub = publish_wall_now;
-            }
-        } else {
-            const bool publish_foxglove_map =
-                publish_foxglove &&
-                chrono::duration_cast<chrono::milliseconds>(
-                    publish_wall_now - last_foxglove_map_pub).count() >=
-                    FOXGLOVE_MAP_INTERVAL_MS;
-            if ((publish_foxglove_map || write_bag_output) &&
-                frame_id % MAP_PUBLISH_INTERVAL == 0 &&
-                ikdtree.Root_Node != nullptr)
-            {
-                PointVector map_storage;
-                ikdtree.flatten(ikdtree.Root_Node, map_storage, NOT_RECORD);
-                PointCloudXYZI map_cloud;
-                map_cloud.points = std::move(map_storage);
-                map_cloud.width = static_cast<uint32_t>(map_cloud.points.size());
-                map_cloud.height = 1;
-                map_cloud.is_dense = true;
-
-                if (write_bag_output && !map_cloud.empty()) {
-                    bag_writer->writePointCloud(pub_time_ns, map_cloud, kFastLioMapFrame,
-                                                kFastLioMapTopic);
-                }
-                if (publish_foxglove_map && !map_cloud.empty()) {
-                    foxglove.publishMap(map_cloud, pub_time);
-                    last_foxglove_map_pub = publish_wall_now;
-                }
             }
         }
         map_schedule_ms = chrono::duration<double, milli>(
             chrono::steady_clock::now() - map_schedule_begin).count();
+        map_schedule_timing.record(map_schedule_ms);
 
         // Publish path
         if (path_en)
         {
-            path_vec.push_back(pos_v3d);
             if (write_bag_output) {
-                bag_writer->writePath(pub_time_ns, path_vec, kFastLioMapFrame);
+                if (path_vec.size() >= bag_path_max_points) {
+                    const size_t trim_count = min(
+                        path_vec.size(),
+                        max<size_t>(1, bag_path_max_points / 10));
+                    path_vec.erase(
+                        path_vec.begin(),
+                        path_vec.begin() +
+                            static_cast<std::ptrdiff_t>(trim_count));
+                    bag_path_points_trimmed += trim_count;
+                }
+                path_vec.push_back(pos_v3d);
+                storage_worker->enqueuePath(pub_time_ns, path_vec, kFastLioMapFrame);
             }
             const bool publish_foxglove_path =
                 publish_foxglove &&
                 chrono::duration_cast<chrono::milliseconds>(
                     publish_wall_now - last_foxglove_path_pub).count() >=
-                    FOXGLOVE_PATH_INTERVAL_MS;
+                    foxglove_path_interval_ms;
+            if (realtime_foxglove.isRunning()) {
+                realtime_foxglove.tryEnqueuePathPoint(
+                    pos_v3d, pub_time, publish_foxglove_path);
+            }
             if (publish_foxglove_path) {
-                foxglove.publishPath(path_vec, pub_time);
                 last_foxglove_path_pub = publish_wall_now;
             }
         }
@@ -1765,7 +2305,7 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                 publish_wall_now - last_foxglove_control_pub).count() >=
                 foxglove_control_interval_ms;
         if (publish_foxglove_control) {
-            foxglove.broadcastTime(pub_time);
+            realtime_foxglove.tryEnqueueTime(pub_time);
             last_foxglove_control_pub = publish_wall_now;
         }
 
@@ -1773,26 +2313,21 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
         s_plot6 = (T2 - T1) * 1000.0;
 
         // ── 7. PCD saving ───────────────────────────────────────────
-        if (pcd_save_en)
+        if (pcd_save_en && storage_worker && storage_worker->isRunning() &&
+            storage_worker->isPcdEnabled())
         {
-            // Accumulate world-frame points
+            PointCloudXYZI pcd_frame;
+            pcd_frame.reserve(feats_undistort->points.size());
             PointType pt_world;
             for (size_t i = 0; i < feats_undistort->points.size(); i++)
             {
                 pointBodyToWorld(&(feats_undistort->points[i]), &pt_world);
-                pcl_wait_save->push_back(pt_world);
+                pcd_frame.push_back(pt_world);
             }
-
-            // Positive intervals save periodically. Non-positive intervals keep
-            // accumulating and are written once during shutdown.
-            if (frame_id > 0 && pcd_interval > 0 &&
-                (frame_id % pcd_interval == 0))
-            {
-                string pcd_path = outputPath("PCD/scans_" + to_string(frame_id) + ".pcd");
-                pcl::io::savePCDFileASCII(pcd_path, *pcl_wait_save);
-                cout << "[PCD] Saved: " << pcd_path
-                     << " (" << pcl_wait_save->size() << " pts)" << endl;
-            }
+            pcd_frame.width = static_cast<uint32_t>(pcd_frame.size());
+            pcd_frame.height = 1;
+            pcd_frame.is_dense = true;
+            storage_worker->enqueuePcd(std::move(pcd_frame));
         }
 
         // ── 8. Timing log ───────────────────────────────────────────
@@ -1815,10 +2350,49 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                    ikdtree.size(), loop_ms);
         }
 
-        AsyncMapPublisher::Stats async_map_stats;
+        MapBuildWorker::Stats async_map_stats;
         if (async_map_publisher) {
             async_map_stats = async_map_publisher->stats();
         }
+        StorageWorker::Stats storage_stats;
+        if (storage_worker) storage_stats = storage_worker->stats();
+        RealtimeFoxgloveWorker::Stats realtime_foxglove_stats;
+        if (realtime_foxglove.isRunning()) {
+            realtime_foxglove_stats = realtime_foxglove.stats();
+        }
+        size_t input_lidar_queue_frames = 0;
+        size_t input_imu_queue_samples = 0;
+        {
+            lock_guard<mutex> lock(mtx_buffer);
+            input_lidar_queue_frames = lidar_buffer.size();
+            input_imu_queue_samples = imu_buffer.size();
+        }
+        if (frame_id % 20 == 0) {
+            process_rss_bytes = currentProcessRssBytes();
+            process_peak_rss_bytes = max(process_peak_rss_bytes, process_rss_bytes);
+        }
+        const auto add_memory_saturated = [](size_t left, size_t right) {
+            return right > numeric_limits<size_t>::max() - left
+                ? numeric_limits<size_t>::max() : left + right;
+        };
+        const size_t storage_pcd_memory_bytes = add_memory_saturated(
+            storage_stats.pcd_pending_bytes,
+            storage_stats.pcd_scratch_bytes);
+        size_t queue_memory_bytes = async_map_stats.input_queue_bytes;
+        queue_memory_bytes = add_memory_saturated(
+            queue_memory_bytes, async_map_stats.output.current_bytes);
+        queue_memory_bytes = add_memory_saturated(
+            queue_memory_bytes, async_map_stats.output.inflight_bytes);
+        queue_memory_bytes = add_memory_saturated(
+            queue_memory_bytes, realtime_foxglove_stats.current_bytes);
+        queue_memory_bytes = add_memory_saturated(
+            queue_memory_bytes, realtime_foxglove_stats.inflight_bytes);
+        queue_memory_bytes = add_memory_saturated(
+            queue_memory_bytes, realtime_foxglove_stats.path_history_bytes);
+        queue_memory_bytes = add_memory_saturated(
+            queue_memory_bytes, storage_stats.hard_usage_bytes);
+        queue_memory_bytes = add_memory_saturated(
+            queue_memory_bytes, storage_pcd_memory_bytes);
 
         ostringstream log_line;
         log_line << fixed << setprecision(3)
@@ -1833,36 +2407,140 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
                  << " map_accumulate_ms=" << map_accumulate_ms
                  << " map_schedule_ms=" << map_schedule_ms
                  << " map_effective_interval_ms=" << effective_full_map_interval_ms
-                 << " map_async_requested=" << async_map_stats.requested
-                 << " map_async_published=" << async_map_stats.published
-                 << " map_async_coalesced=" << async_map_stats.coalesced
-                 << " map_async_snapshot_ms=" << async_map_stats.last_snapshot_ms
-                 << " map_async_send_ms=" << async_map_stats.last_publish_ms
-                 << " map_async_points=" << async_map_stats.last_point_count
-                 << " map_accumulator_points=" << full_map_accumulator.size()
+                 << " map_async_requested=" << async_map_stats.full_requested
+                 << " map_async_published=" << async_map_stats.output.full_published
+                 << " map_async_coalesced=" << async_map_stats.full_coalesced
+                 << " tile_resync_requested="
+                 << async_map_stats.tile_resync_requested
+                 << " tile_resync_on_failure="
+                 << async_map_stats.tile_resync_on_failure
+                 << " tile_resync_completed="
+                 << async_map_stats.tile_resync_completed
+                 << " map_async_snapshot_ms=" << async_map_stats.last_full_snapshot_ms
+                 << " map_async_send_ms=" << async_map_stats.output.last_full_publish_ms
+                 << " map_async_points=" << async_map_stats.last_full_points
+                 << " map_accumulator_points=" << async_map_stats.store.voxel_count
                  << " map_frames_enqueued=" << async_map_stats.frames_enqueued
                  << " map_frames_built=" << async_map_stats.frames_built
                  << " map_frames_dropped=" << async_map_stats.frames_dropped
-                 << " map_frame_queue_current=" << async_map_stats.current_frame_queue_depth
-                 << " map_frame_queue_max=" << async_map_stats.max_frame_queue_depth
-                 << " map_frame_points=" << async_map_stats.last_frame_point_count
-                 << " map_frame_build_ms=" << async_map_stats.last_frame_build_ms
-                 << " map_delta_requested=" << async_map_stats.delta_requested
-                 << " map_delta_published=" << async_map_stats.delta_published
-                 << " map_delta_coalesced=" << async_map_stats.delta_coalesced
-                 << " map_delta_dropped_points=" << async_map_stats.delta_dropped_points
-                 << " map_delta_resync_requests=" << async_map_stats.delta_resync_requests
-                 << " map_delta_queue_points=" << async_map_stats.current_delta_points
-                 << " map_delta_points=" << async_map_stats.last_delta_point_count
-                 << " map_delta_send_ms=" << async_map_stats.last_delta_publish_ms
-                 << " map_full_pending=" << (async_map_stats.full_map_pending ? 1 : 0)
+                 << " map_input_incomplete=" << async_map_stats.input_incomplete
+                 << " map_input_points_dropped="
+                 << async_map_stats.input_points_dropped
+                 << " map_input_bytes_dropped="
+                 << async_map_stats.input_bytes_dropped
+                 << " map_input_tile_changes_enqueued="
+                 << async_map_stats.input_tile_changes_enqueued
+                 << " map_input_tile_changes_merged="
+                 << async_map_stats.input_tile_changes_merged
+                 << " map_input_tile_changes_dropped="
+                 << async_map_stats.input_tile_changes_dropped
+                 << " map_input_tile_tasks_evicted="
+                 << async_map_stats.input_tile_tasks_evicted
+                 << " map_input_resync_requested="
+                 << async_map_stats.input_resync_requested
+                 << " map_incomplete="
+                 << ((async_map_stats.incomplete ||
+                      async_map_stats.store.incomplete) ? 1 : 0)
+                 << " map_accumulation_stopped="
+                 << (async_map_stats.store.accumulation_stopped ? 1 : 0)
+                 << " map_points_rejected_memory="
+                 << async_map_stats.store.points_rejected_memory
+                 << " map_points_rejected_invalid="
+                 << async_map_stats.store.points_rejected_invalid
+                 << " map_frame_queue_current=" << async_map_stats.input_queue_tasks
+                 << " map_frame_queue_points=" << async_map_stats.input_queue_points
+                 << " map_frame_queue_bytes=" << async_map_stats.input_queue_bytes
+                 << " map_frame_queue_max=" << async_map_stats.max_input_queue_tasks
+                 << " map_frame_queue_max_points="
+                 << async_map_stats.max_input_queue_points
+                 << " map_frame_queue_max_bytes="
+                 << async_map_stats.max_input_queue_bytes
+                 << " map_frame_points=" << async_map_stats.last_frame_points
+                 << " map_frame_build_ms=" << async_map_stats.last_build_ms
+                 << " tile_count=" << async_map_stats.store.tile_count
+                 << " tile_dirty=" << async_map_stats.store.dirty_count
+                 << " tile_evicted=" << async_map_stats.store.tiles_evicted
+                 << " tile_pending_deletions="
+                 << async_map_stats.store.pending_deletion_count
+                 << " tile_deletions_backpressured="
+                 << async_map_stats.store.deletions_backpressured
+                 << " tile_updates=" << async_map_stats.tile_updates
+                 << " tile_extract_ms=" << async_map_stats.last_tile_extract_ms
+                 << " map_memory_bytes=" << async_map_stats.store.estimated_bytes
+                 << " foxglove_queue_tasks=" << async_map_stats.output.current_tasks
+                 << " foxglove_queue_bytes=" << async_map_stats.output.current_bytes
+                 << " foxglove_overwritten=" << async_map_stats.output.full_overwritten
+                 << " tile_merged=" << async_map_stats.output.tiles_merged
+                 << " tile_dropped=" << async_map_stats.output.tiles_dropped
+                 << " tile_retried=" << async_map_stats.output.tiles_retried
+                 << " realtime_queue_tasks="
+                 << realtime_foxglove_stats.current_tasks
+                 << " realtime_queue_points="
+                 << realtime_foxglove_stats.current_points
+                 << " realtime_queue_bytes="
+                 << realtime_foxglove_stats.current_bytes
+                 << " realtime_path_history_bytes="
+                 << realtime_foxglove_stats.path_history_bytes
+                 << " realtime_overwritten="
+                 << (realtime_foxglove_stats.playback.overwritten +
+                     realtime_foxglove_stats.time.overwritten +
+                     realtime_foxglove_stats.pose.overwritten +
+                     realtime_foxglove_stats.imu.overwritten +
+                     realtime_foxglove_stats.cloud.overwritten +
+                     realtime_foxglove_stats.path.overwritten)
+                 << " realtime_dropped="
+                 << (realtime_foxglove_stats.playback.dropped +
+                     realtime_foxglove_stats.time.dropped +
+                     realtime_foxglove_stats.pose.dropped +
+                     realtime_foxglove_stats.imu.dropped +
+                     realtime_foxglove_stats.cloud.dropped +
+                     realtime_foxglove_stats.path.dropped)
+                 << " realtime_failures=" << realtime_foxglove_stats.failures
+                  << " storage_queue_tasks=" << storage_stats.queue_tasks
+                  << " storage_queue_bytes=" << storage_stats.queue_bytes
+                  << " storage_inflight_tasks=" << storage_stats.inflight_tasks
+                  << " storage_inflight_points=" << storage_stats.inflight_points
+                  << " storage_inflight_bytes=" << storage_stats.inflight_bytes
+                  << " storage_hard_usage_bytes="
+                  << storage_stats.hard_usage_bytes
+                  << " storage_dropped=" << storage_stats.tasks_dropped
+                  << " storage_overwritten=" << storage_stats.tasks_overwritten
+                  << " bag_path_points=" << path_vec.size()
+                  << " bag_path_points_trimmed=" << bag_path_points_trimmed
+                 << " storage_write_ms=" << storage_stats.last_write_ms
+                  << " pcd_queue_points=" << storage_stats.pcd_pending_points
+                  << " pcd_queue_bytes=" << storage_stats.pcd_pending_bytes
+                  << " pcd_pending_capacity_points="
+                  << storage_stats.pcd_pending_capacity_points
+                  << " pcd_scratch_bytes=" << storage_stats.pcd_scratch_bytes
+                  << " storage_pcd_memory_bytes=" << storage_pcd_memory_bytes
+                  << " queue_memory_bytes=" << queue_memory_bytes
+                  << " process_rss_bytes=" << process_rss_bytes
+                  << " process_peak_rss_bytes=" << process_peak_rss_bytes
                  << " map_worker_busy=" << (async_map_stats.busy ? 1 : 0)
+                 << " input_lidar_queue_frames="
+                 << input_lidar_queue_frames
+                 << " input_lidar_queue_high_water="
+                 << input_lidar_queue_high_water.load()
+                 << " input_lidar_frames_dropped="
+                 << input_lidar_frames_dropped.load()
+                 << " input_imu_queue_samples="
+                 << input_imu_queue_samples
+                 << " input_imu_queue_high_water="
+                 << input_imu_queue_high_water.load()
+                 << " input_imu_samples_dropped="
+                 << input_imu_samples_dropped.load()
                  << " total_ms=" << loop_ms
                  << " points=" << feats_down_size
                  << " tree_size=" << ikdtree.size()
+                 << setprecision(9)
                  << " pos=(" << state_point.pos(0) << ","
                  << state_point.pos(1) << ","
-                 << state_point.pos(2) << ")";
+                 << state_point.pos(2) << ")"
+                 << " quat=(" << geoQuat.w() << ","
+                 << geoQuat.x() << ","
+                 << geoQuat.y() << ","
+                 << geoQuat.z() << ")";
         writeRuntimeLog(log_line.str());
 
         frame_id++;
@@ -1875,107 +2553,519 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
     // ══════════════════════════════════════════════════════════════════
     //  Shutdown
     // ══════════════════════════════════════════════════════════════════
+    const auto shutdown_deadline =
+        chrono::steady_clock::now() + chrono::seconds(30);
+    ShutdownWatchdog shutdown_watchdog(shutdown_deadline);
+    if (!shutdown_watchdog.start()) terminateForShutdownTimeout();
+
     cout << "\n[LaserMapping] Shutting down..." << endl;
 
-    const uint64_t final_time_ns = playback_current_time_ns.load();
+    const uint64_t final_time_ns =
+        playback_control_state->current_time_ns.load();
     const double final_time = static_cast<double>(final_time_ns) / 1e9;
-    bool final_foxglove_map_published_async = false;
-    if (async_map_publisher && async_map_publisher->isRunning()) {
-        if (publish_full_map && foxglove.isRunning()) {
-            async_map_publisher->request(final_time);
-            async_map_publisher->flush();
-            final_foxglove_map_published_async = true;
-        }
-        const auto final_async_stats = async_map_publisher->stats();
-        async_map_publisher->stop();
-        ostringstream async_log;
-        async_log << fixed << setprecision(3)
-                  << "event=async_map_summary"
-                  << " requested=" << final_async_stats.requested
-                  << " published=" << final_async_stats.published
-                  << " coalesced=" << final_async_stats.coalesced
-                  << " failures=" << final_async_stats.failures
-                  << " points=" << final_async_stats.last_point_count
-                  << " snapshot_ms=" << final_async_stats.last_snapshot_ms
-                  << " publish_ms=" << final_async_stats.last_publish_ms
-                  << " frames_enqueued=" << final_async_stats.frames_enqueued
-                  << " frames_built=" << final_async_stats.frames_built
-                  << " frames_dropped=" << final_async_stats.frames_dropped
-                  << " frame_queue_max=" << final_async_stats.max_frame_queue_depth
-                  << " frame_points=" << final_async_stats.last_frame_point_count
-                  << " frame_build_ms=" << final_async_stats.last_frame_build_ms
-                  << " delta_requested=" << final_async_stats.delta_requested
-                  << " delta_published=" << final_async_stats.delta_published
-                  << " delta_coalesced=" << final_async_stats.delta_coalesced
-                  << " delta_dropped_points=" << final_async_stats.delta_dropped_points
-                  << " delta_resync_requests=" << final_async_stats.delta_resync_requests
-                  << " delta_points=" << final_async_stats.last_delta_point_count
-                  << " delta_publish_ms=" << final_async_stats.last_delta_publish_ms;
-        writeRuntimeLog(async_log.str());
+    const auto remaining_shutdown = [&]() {
+        const auto now = chrono::steady_clock::now();
+        if (now >= shutdown_deadline) return chrono::milliseconds(0);
+        return chrono::duration_cast<chrono::milliseconds>(
+            shutdown_deadline - now);
+    };
+    const auto shutdown_slice = [&](chrono::milliseconds maximum) {
+        return min(remaining_shutdown(), maximum);
+    };
+
+    // Stop producers before draining consumers so no new task can race the
+    // shared shutdown deadline.
+    replay_backpressure_stop = true;
+    sig_buffer.notify_all();
+    playback_reader_lifetime.disarm();
+    if (lvx_reader &&
+        !lvx_reader->stopFor(shutdown_slice(chrono::seconds(5))))
+    {
+        terminateForShutdownTimeout();
+    }
+    if (livox_adapter &&
+        !livox_adapter->stopFor(shutdown_slice(chrono::seconds(5))))
+    {
+        terminateForShutdownTimeout();
+    }
+    if (bag_reader &&
+        !bag_reader->stopFor(shutdown_slice(chrono::seconds(5))))
+    {
+        terminateForShutdownTimeout();
     }
 
-    const bool need_sync_final_map =
-        publish_full_map &&
-        ((foxglove.isRunning() && !final_foxglove_map_published_async) ||
-         (bag_writer && bag_writer->isOpen()));
-    if (need_sync_final_map) {
-        PointCloudXYZI final_map = full_map_accumulator.snapshot();
-        if (!final_map.empty()) {
-            final_map.width = static_cast<uint32_t>(final_map.points.size());
-            final_map.height = 1;
-            final_map.is_dense = true;
-            if (bag_writer && bag_writer->isOpen()) {
-                bag_writer->writePointCloud(final_time_ns, final_map, kFastLioMapFrame,
-                                            kFastLioMapTopic);
-            }
-            if (foxglove.isRunning() && !final_foxglove_map_published_async) {
-                foxglove.publishMap(final_map, final_time);
-            }
-        }
+    {
+        lock_guard<mutex> lock(mtx_buffer);
+        ostringstream input_summary;
+        input_summary << "event=input_queue_summary"
+                      << " lidar_current=" << lidar_buffer.size()
+                      << " lidar_capacity="
+                      << (replay_backpressure_enabled.load()
+                              ? MAX_REPLAY_LIDAR_QUEUE
+                              : MAX_LIVE_LIDAR_QUEUE)
+                      << " lidar_high_water="
+                      << input_lidar_queue_high_water.load()
+                      << " lidar_dropped="
+                      << input_lidar_frames_dropped.load()
+                      << " imu_current=" << imu_buffer.size()
+                      << " imu_capacity=" << MAX_IMU_QUEUE
+                      << " imu_high_water="
+                      << input_imu_queue_high_water.load()
+                      << " imu_dropped="
+                      << input_imu_samples_dropped.load();
+        writeRuntimeLog(input_summary.str());
     }
+    // Keep potentially expensive input-file close and message-buffer release
+    // inside the watchdog window. Playback callbacks were disarmed before the
+    // producer stop barrier, so no Foxglove request can reach these objects.
+    lvx_reader.reset();
+    livox_adapter.reset();
+    bag_reader.reset();
 
-    if ((use_lvx || use_bag) && foxglove.isRunning()) {
-        foxglove.broadcastPlaybackState(FoxglovePublisher::PlaybackState{
+    if ((use_lvx || use_bag) && foxglove.getClientCount() > 0 &&
+        realtime_foxglove.isRunning())
+    {
+        realtime_foxglove.tryEnqueuePlayback(FoxglovePublisher::PlaybackState{
             FoxglovePublisher::PlaybackStatus::Ended,
-            playback_current_time_ns.load(),
-            static_cast<float>(playback_speed.load()),
+            playback_control_state->current_time_ns.load(),
+            static_cast<float>(playback_control_state->speed.load()),
             false});
     }
 
-    // Stop data sources
-    replay_backpressure_stop = true;
-    sig_buffer.notify_all();
-    if (lvx_reader) lvx_reader->stop();
-    if (livox_adapter) livox_adapter->stop();
-    if (bag_reader) bag_reader->stop();
-
-    // Save final PCD if enabled
-    if (pcd_save_en && pcl_wait_save->size() > 0)
+    if (async_map_publisher && async_map_publisher->isRunning() &&
+        publish_full_map &&
+        (foxglove.getClientCount() > 0 ||
+         (storage_worker && storage_worker->isBagOpen())))
     {
-        string pcd_path = outputPath("PCD/scans_final.pcd");
-        pcl::io::savePCDFileASCII(pcd_path, *pcl_wait_save);
-        cout << "[PCD] Final cloud saved: " << pcd_path
-             << " (" << pcl_wait_save->size() << " pts)" << endl;
+        if (storage_worker && storage_worker->isBagOpen()) {
+            final_bag_map_requested = true;
+        }
+        async_map_publisher->request(final_time);
     }
 
-    // Dump ikd-Tree map
-    {
-        PointVector map_storage;
-        ikdtree.flatten(ikdtree.Root_Node, map_storage, NOT_RECORD);
-        if (!map_storage.empty())
-        {
-            PointCloudXYZI map_cloud;
-            map_cloud.points = map_storage;
-            string map_path = outputPath("PCD/ikd_tree_map.pcd");
-            pcl::io::savePCDFileASCII(map_path, map_cloud);
-            cout << "[PCD] ikd-Tree map saved: " << map_path
-                 << " (" << map_cloud.size() << " pts)" << endl;
+    if (realtime_foxglove.isRunning()) {
+        if (!realtime_foxglove.stopFor(
+                shutdown_slice(chrono::seconds(3)), true)) {
+            terminateForShutdownTimeout();
+        }
+        const auto realtime_stats = realtime_foxglove.stats();
+        ostringstream realtime_log;
+        realtime_log << fixed << setprecision(3)
+                     << "event=realtime_foxglove_summary"
+                     << " queue_max_tasks=" << realtime_stats.max_tasks
+                     << " queue_max_points=" << realtime_stats.max_points
+                     << " queue_max_bytes=" << realtime_stats.max_bytes
+                     << " failures=" << realtime_stats.failures
+                     << " cancelled=" << realtime_stats.tasks_cancelled
+                     << " stop_timeouts=" << realtime_stats.stop_timeouts
+                     << " pose_published=" << realtime_stats.pose.published
+                     << " pose_overwritten=" << realtime_stats.pose.overwritten
+                     << " cloud_published=" << realtime_stats.cloud.published
+                     << " cloud_overwritten=" << realtime_stats.cloud.overwritten
+                     << " cloud_dropped=" << realtime_stats.cloud.dropped
+                     << " path_published=" << realtime_stats.path.published
+                     << " path_overwritten=" << realtime_stats.path.overwritten
+                     << " path_points_received="
+                     << realtime_stats.path_points_received
+                     << " path_points_dropped="
+                     << realtime_stats.path_points_dropped
+                     << " path_points_trimmed="
+                     << realtime_stats.path_points_trimmed
+                     << " path_history_bytes="
+                     << realtime_stats.path_history_bytes
+                     << " control_overwritten="
+                     << (realtime_stats.time.overwritten +
+                         realtime_stats.playback.overwritten)
+                     << " imu_overwritten=" << realtime_stats.imu.overwritten;
+        writeRuntimeLog(realtime_log.str());
+    }
+
+    MapBuildWorker::TimingStats final_map_timing;
+    if (async_map_publisher) {
+        if (!async_map_publisher->stopFor(
+                shutdown_slice(chrono::seconds(10)), true)) {
+            terminateForShutdownTimeout();
+        }
+        const auto final_async_stats = async_map_publisher->stats();
+        final_map_timing = async_map_publisher->timingStats();
+        ostringstream async_log;
+        async_log << fixed << setprecision(3)
+                  << "event=async_map_summary"
+                  << " requested=" << final_async_stats.full_requested
+                  << " published=" << final_async_stats.output.full_published
+                  << " coalesced=" << final_async_stats.full_coalesced
+                  << " tile_resync_requested="
+                  << final_async_stats.tile_resync_requested
+                  << " tile_resync_on_failure="
+                  << final_async_stats.tile_resync_on_failure
+                  << " tile_resync_completed="
+                  << final_async_stats.tile_resync_completed
+                  << " failures=" << final_async_stats.failures
+                  << " points=" << final_async_stats.last_full_points
+                  << " snapshot_ms=" << final_async_stats.last_full_snapshot_ms
+                  << " publish_ms=" << final_async_stats.output.last_full_publish_ms
+                  << " frames_enqueued=" << final_async_stats.frames_enqueued
+                  << " frames_built=" << final_async_stats.frames_built
+                  << " frames_dropped=" << final_async_stats.frames_dropped
+                  << " input_points_dropped="
+                  << final_async_stats.input_points_dropped
+                  << " input_bytes_dropped="
+                  << final_async_stats.input_bytes_dropped
+                  << " input_tile_changes_enqueued="
+                  << final_async_stats.input_tile_changes_enqueued
+                  << " input_tile_changes_merged="
+                  << final_async_stats.input_tile_changes_merged
+                  << " input_tile_changes_dropped="
+                  << final_async_stats.input_tile_changes_dropped
+                  << " input_tile_tasks_evicted="
+                  << final_async_stats.input_tile_tasks_evicted
+                  << " input_resync_requested="
+                  << final_async_stats.input_resync_requested
+                  << " frames_cancelled=" << final_async_stats.frames_cancelled
+                  << " control_cancelled="
+                  << final_async_stats.control_tasks_cancelled
+                  << " stop_timeouts=" << final_async_stats.stop_timeouts
+                  << " incomplete="
+                  << ((final_async_stats.incomplete ||
+                       final_async_stats.store.incomplete) ? 1 : 0)
+                  << " frame_queue_max=" << final_async_stats.max_input_queue_tasks
+                  << " frame_queue_max_points="
+                  << final_async_stats.max_input_queue_points
+                  << " frame_queue_max_bytes="
+                  << final_async_stats.max_input_queue_bytes
+                  << " frame_points=" << final_async_stats.last_frame_points
+                  << " frame_build_ms=" << final_async_stats.last_build_ms
+                  << " tile_count=" << final_async_stats.store.tile_count
+                  << " tile_updates=" << final_async_stats.tile_updates
+                  << " tile_merged=" << final_async_stats.output.tiles_merged
+                  << " tile_dropped=" << final_async_stats.output.tiles_dropped
+                  << " tile_retried=" << final_async_stats.output.tiles_retried
+                  << " tile_rejected_capacity="
+                  << final_async_stats.store.points_rejected_tile_capacity
+                  << " points_rejected_memory="
+                  << final_async_stats.store.points_rejected_memory
+                  << " points_rejected_invalid="
+                  << final_async_stats.store.points_rejected_invalid
+                  << " accumulation_stopped="
+                  << (final_async_stats.store.accumulation_stopped ? 1 : 0)
+                  << " tiles_evicted="
+                  << final_async_stats.store.tiles_evicted
+                  << " pending_deletions="
+                  << final_async_stats.store.pending_deletion_count
+                  << " deletions_backpressured="
+                  << final_async_stats.store.deletions_backpressured
+                  << " tile_cancelled="
+                  << final_async_stats.output.tiles_cancelled
+                  << " full_cancelled="
+                  << final_async_stats.output.full_cancelled
+                  << " map_memory_bytes=" << final_async_stats.store.estimated_bytes;
+        writeRuntimeLog(async_log.str());
+        if (final_bag_map_requested.load()) {
+            cerr << "[LaserMapping] Final Bag map could not be queued; "
+                    "the storage summary will report the drop." << endl;
         }
     }
 
-    // Stop Foxglove / Bag writer
-    if (bag_writer) bag_writer->close();
-    foxglove.stop();
+    const auto map_accumulate_summary = map_accumulate_timing.summary();
+    const auto map_schedule_summary = map_schedule_timing.summary();
+    const auto foxglove_map_timing = foxglove.mapTimingStats();
+    ostringstream timing_log;
+    timing_log << fixed << setprecision(3)
+               << "event=timing_summary"
+               << " window_capacity=" << BoundedTimingWindow<>::capacity();
+    const auto append_timing = [&timing_log](
+        const char* name, const TimingWindowSummary& timing) {
+        timing_log << ' ' << name << "_samples=" << timing.total_samples
+                   << ' ' << name << "_window_samples=" << timing.window_samples
+                   << ' ' << name << "_avg_ms=" << timing.average_ms
+                   << ' ' << name << "_p95_ms=" << timing.p95_ms
+                   << ' ' << name << "_p99_ms=" << timing.p99_ms;
+    };
+    append_timing("map_accumulate", map_accumulate_summary);
+    append_timing("map_schedule", map_schedule_summary);
+    append_timing("map_build", final_map_timing.map_build);
+    append_timing("tile_extract", final_map_timing.tile_extract);
+    append_timing("tile_publish", final_map_timing.output.tile_publish);
+    append_timing("full_snapshot", final_map_timing.full_snapshot);
+    append_timing("full_publish", final_map_timing.output.full_publish);
+    append_timing("full_serialize", foxglove_map_timing.serialize);
+    append_timing("full_send", foxglove_map_timing.send);
+    writeRuntimeLog(timing_log.str());
+
+    if (storage_worker) {
+        if (!storage_worker->stopFor(remaining_shutdown(), true)) {
+            terminateForShutdownTimeout();
+        }
+        const auto storage_stats = storage_worker->stats();
+        const auto storage_timing = storage_worker->timingStats();
+        ostringstream storage_log;
+        storage_log << fixed << setprecision(3)
+                    << "event=storage_summary"
+                    << " timing_window_capacity="
+                    << BoundedTimingWindow<>::capacity()
+                    << " enqueued=" << storage_stats.tasks_enqueued
+                    << " written=" << storage_stats.tasks_written
+                    << " dropped=" << storage_stats.tasks_dropped
+                    << " overwritten=" << storage_stats.tasks_overwritten
+                    << " cancelled=" << storage_stats.tasks_cancelled
+                    << " stop_timeouts=" << storage_stats.stop_timeouts
+                    << " startup_timeouts=" << storage_stats.startup_timeouts
+                    << " failures=" << storage_stats.failures
+                    << " failed=" << (storage_stats.failed ? 1 : 0)
+                    << " worker_exited="
+                    << (storage_stats.worker_exited ? 1 : 0)
+                    << " bag_failures=" << storage_stats.bag_failures
+                    << " bag_tasks_cancelled="
+                    << storage_stats.bag_tasks_cancelled
+                    << " bag_disabled="
+                    << (storage_stats.bag_disabled ? 1 : 0)
+                    << " pcd_failures=" << storage_stats.pcd_failures
+                    << " pcd_disabled="
+                    << (storage_stats.pcd_disabled ? 1 : 0)
+                    << " pcd_tasks_dropped="
+                    << storage_stats.pcd_tasks_dropped
+                    << " pcd_points_dropped="
+                    << storage_stats.pcd_points_dropped
+                    << " pcd_bytes_dropped="
+                    << storage_stats.pcd_bytes_dropped
+                    << " pcd_tasks_cancelled="
+                    << storage_stats.pcd_tasks_cancelled
+                    << " pcd_points_cancelled="
+                    << storage_stats.pcd_points_cancelled
+                    << " pcd_bytes_cancelled="
+                    << storage_stats.pcd_bytes_cancelled
+                    << " queue_tasks=" << storage_stats.queue_tasks
+                    << " queue_bytes=" << storage_stats.queue_bytes
+                    << " inflight_tasks=" << storage_stats.inflight_tasks
+                    << " inflight_points=" << storage_stats.inflight_points
+                    << " inflight_bytes=" << storage_stats.inflight_bytes
+                    << " hard_usage_bytes="
+                    << storage_stats.hard_usage_bytes
+                    << " queue_max_bytes=" << storage_stats.max_queue_bytes
+                    << " max_hard_usage_bytes="
+                    << storage_stats.max_hard_usage_bytes
+                    << " pcd_pending_capacity_points="
+                    << storage_stats.pcd_pending_capacity_points
+                    << " pcd_pending_tasks="
+                    << storage_stats.pcd_pending_tasks
+                    << " pcd_pending_points="
+                    << storage_stats.pcd_pending_points
+                    << " pcd_pending_bytes="
+                    << storage_stats.pcd_pending_bytes
+                    << " pcd_scratch_bytes="
+                    << storage_stats.pcd_scratch_bytes
+                    << " pcd_queue_tasks=" << storage_stats.pcd_queue_tasks
+                    << " pcd_queue_points=" << storage_stats.pcd_queue_points
+                    << " pcd_queue_bytes=" << storage_stats.pcd_queue_bytes
+                    << " max_pcd_pending_bytes="
+                    << storage_stats.max_pcd_pending_bytes
+                    << " max_pcd_scratch_bytes="
+                    << storage_stats.max_pcd_scratch_bytes
+                    << " pcd_chunks=" << storage_stats.pcd_chunks_written
+                    << " pcd_chunk_points_limit="
+                    << storage_stats.pcd_chunk_points_limit
+                    << " pcd_chunk_frames_limit="
+                    << storage_stats.pcd_chunk_frames_limit
+                    << " bag_path_points=" << path_vec.size()
+                    << " bag_path_points_trimmed=" << bag_path_points_trimmed
+                    << " write_ms=" << storage_stats.last_write_ms
+                    << " flush_ms=" << storage_stats.last_flush_ms;
+        const auto append_storage_timing = [&storage_log](
+            const char* name, const TimingWindowSummary& timing) {
+            storage_log << ' ' << name << "_samples=" << timing.total_samples
+                        << ' ' << name << "_window_samples="
+                        << timing.window_samples
+                        << ' ' << name << "_avg_ms=" << timing.average_ms
+                        << ' ' << name << "_p95_ms=" << timing.p95_ms
+                        << ' ' << name << "_p99_ms=" << timing.p99_ms;
+        };
+        append_storage_timing("write", storage_timing.write);
+        append_storage_timing("bag_write", storage_timing.bag_write);
+        append_storage_timing("pcd_write", storage_timing.pcd_write);
+        append_storage_timing("flush", storage_timing.flush);
+        writeRuntimeLog(storage_log.str());
+    }
+
+    // Their worker threads are joined; release bounded queues, tile storage,
+    // bag handles, and pending PCD buffers before disarming the watchdog.
+    async_map_publisher.reset();
+    storage_worker.reset();
+
+    // Flattening and PCD compression are shutdown-only, but both can still be
+    // unexpectedly slow on a damaged/full disk. Run them behind the same
+    // process-wide deadline. If they cannot finish, TerminateProcess is used before
+    // stack unwinding so no detached thread can observe destroyed SLAM state.
+    if (config.storage_save_final_ikdtree) {
+        struct FinalExportState {
+            mutex state_mutex;
+            condition_variable done_cv;
+            bool done = false;
+            size_t points = 0;
+            double flatten_ms = 0.0;
+            double write_ms = 0.0;
+            int write_result = 0;
+            string map_path;
+            string temporary_path;
+            string failure;
+        };
+        auto export_state = make_shared<FinalExportState>();
+        thread export_thread;
+        try {
+            export_thread = thread([export_state] {
+                try {
+                    const auto flatten_begin = chrono::steady_clock::now();
+                    PointVector map_storage;
+                    ikdtree.flatten(
+                        ikdtree.Root_Node, map_storage, NOT_RECORD);
+                    export_state->flatten_ms =
+                        chrono::duration<double, milli>(
+                            chrono::steady_clock::now() - flatten_begin)
+                            .count();
+                    export_state->points = map_storage.size();
+                    if (!map_storage.empty()) {
+                        PointCloudXYZI map_cloud;
+                        map_cloud.points = std::move(map_storage);
+                        map_cloud.width =
+                            static_cast<uint32_t>(map_cloud.size());
+                        map_cloud.height = 1;
+                        map_cloud.is_dense = true;
+                        export_state->map_path =
+                            outputPath("PCD/ikd_tree_map.pcd");
+                        export_state->temporary_path =
+                            export_state->map_path + ".tmp";
+                        const auto write_begin = chrono::steady_clock::now();
+                        export_state->write_result =
+                            pcl::io::savePCDFileBinaryCompressed(
+                                export_state->temporary_path, map_cloud);
+                        if (export_state->write_result == 0) {
+                            if (!::MoveFileExA(
+                                    export_state->temporary_path.c_str(),
+                                    export_state->map_path.c_str(),
+                                    MOVEFILE_REPLACE_EXISTING |
+                                        MOVEFILE_WRITE_THROUGH))
+                            {
+                                const DWORD error = ::GetLastError();
+                                ::DeleteFileA(
+                                    export_state->temporary_path.c_str());
+                                throw std::system_error(
+                                    static_cast<int>(error),
+                                    std::system_category(),
+                                    "could not atomically replace final PCD");
+                            }
+                        } else {
+                            ::DeleteFileA(export_state->temporary_path.c_str());
+                        }
+                        export_state->write_ms =
+                            chrono::duration<double, milli>(
+                                chrono::steady_clock::now() - write_begin)
+                                .count();
+                    }
+                } catch (const std::exception& error) {
+                    if (!export_state->temporary_path.empty()) {
+                        ::DeleteFileA(export_state->temporary_path.c_str());
+                    }
+                    export_state->failure = error.what();
+                } catch (...) {
+                    if (!export_state->temporary_path.empty()) {
+                        ::DeleteFileA(export_state->temporary_path.c_str());
+                    }
+                    export_state->failure = "unknown";
+                }
+                {
+                    lock_guard<mutex> lock(export_state->state_mutex);
+                    export_state->done = true;
+                }
+                export_state->done_cv.notify_all();
+            });
+        } catch (const std::exception& error) {
+            export_state->failure = error.what();
+            export_state->done = true;
+        }
+
+        if (export_thread.joinable()) {
+            unique_lock<mutex> lock(export_state->state_mutex);
+            const bool completed = export_state->done_cv.wait_until(
+                lock, shutdown_deadline,
+                [&] { return export_state->done; });
+            lock.unlock();
+            if (!completed) {
+                terminateForShutdownTimeout();
+            }
+            export_thread.join();
+        }
+
+        if (!export_state->failure.empty()) {
+            cerr << "[PCD] Final ikd-Tree export failed: "
+                 << export_state->failure << endl;
+            writeRuntimeLog(
+                "event=final_ikdtree_export failure=\"" +
+                export_state->failure + "\"");
+        } else {
+            if (export_state->points > 0 &&
+                export_state->write_result == 0)
+            {
+                cout << "[PCD] ikd-Tree map saved: "
+                     << export_state->map_path << " ("
+                     << export_state->points << " pts)" << endl;
+            } else if (export_state->write_result != 0) {
+                cerr << "[PCD] Failed to save final ikd-Tree map: "
+                     << export_state->map_path << " (error="
+                     << export_state->write_result << ")" << endl;
+            }
+            ostringstream export_log;
+            export_log << fixed << setprecision(3)
+                       << "event=final_ikdtree_export"
+                       << " points=" << export_state->points
+                       << " flatten_ms=" << export_state->flatten_ms
+                       << " write_ms=" << export_state->write_ms
+                       << " result=" << export_state->write_result;
+            writeRuntimeLog(export_log.str());
+        }
+    }
+
+    process_rss_bytes = currentProcessRssBytes();
+    process_peak_rss_bytes = max(process_peak_rss_bytes, process_rss_bytes);
+    writeRuntimeLog(
+        "event=memory_summary process_rss_bytes=" +
+        to_string(process_rss_bytes) + " process_peak_rss_bytes=" +
+        to_string(process_peak_rss_bytes));
+
+    // Stop Foxglove after asynchronous output workers have drained, still
+    // under the total shutdown deadline.
+    struct FoxgloveStopState {
+        mutex state_mutex;
+        condition_variable done_cv;
+        bool done = false;
+        bool failed = false;
+    };
+    auto foxglove_stop_state = make_shared<FoxgloveStopState>();
+    thread foxglove_stop_thread;
+    try {
+        foxglove_stop_thread = thread([&foxglove, foxglove_stop_state] {
+            try {
+                foxglove.stop();
+            } catch (...) {
+                foxglove_stop_state->failed = true;
+            }
+            {
+                lock_guard<mutex> lock(foxglove_stop_state->state_mutex);
+                foxglove_stop_state->done = true;
+            }
+            foxglove_stop_state->done_cv.notify_all();
+        });
+    } catch (...) {
+        terminateForShutdownTimeout();
+    }
+    {
+        unique_lock<mutex> lock(foxglove_stop_state->state_mutex);
+        const bool completed = foxglove_stop_state->done_cv.wait_until(
+            lock, shutdown_deadline,
+            [&] { return foxglove_stop_state->done; });
+        lock.unlock();
+        if (!completed) terminateForShutdownTimeout();
+    }
+    foxglove_stop_thread.join();
+    if (foxglove_stop_state->failed) terminateForShutdownTimeout();
 
     // Close IMU log
     if (imu_proc.fout_imu.is_open())
@@ -1988,4 +3078,5 @@ void runLaserMapping(FastLioConfig &config, bool use_lvx, const string &lvx_path
 
     cout << "[LaserMapping] Total frames processed: " << frame_id << endl;
     cout << "[LaserMapping] Done." << endl;
+    shutdown_watchdog.cancelAndJoin();
 }

@@ -121,6 +121,8 @@ private:
                                  uint32_t default_val = 0);
     static uint64_t getFieldU64(const FieldMap& fields, const std::string& key,
                                  uint64_t default_val = 0);
+    static uint64_t getFieldTimeNs(const FieldMap& fields, const std::string& key,
+                                   uint64_t default_val = 0);
 
     std::ifstream file_;
     std::string filepath_;

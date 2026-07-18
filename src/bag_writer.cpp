@@ -2,16 +2,24 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
+#include <utility>
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Construction / Destruction
 // ═══════════════════════════════════════════════════════════════════════
 
-BagWriter::BagWriter() {}
+BagWriter::BagWriter(IoHook io_hook) : io_hook_(std::move(io_hook)) {}
 
 BagWriter::~BagWriter() {
-    close();
+    try {
+        close();
+    } catch (...) {
+        // Destructors must not terminate the process. Explicit close() callers
+        // still receive the original I/O failure.
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -19,15 +27,51 @@ BagWriter::~BagWriter() {
 // ═══════════════════════════════════════════════════════════════════════
 
 void BagWriter::writeRaw(const void* data, size_t len) {
+    ensureStreamGood("write");
+    if (len > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::overflow_error("[BagWriter] write length exceeds stream limit: " +
+                                  filepath_);
+    }
+    if (len == 0) return;
     file_.write(static_cast<const char*>(data), static_cast<std::streamsize>(len));
+    ensureStreamGood("write");
 }
 
 void BagWriter::writeU32(uint32_t v) {
     writeRaw(&v, 4);
 }
 
-void BagWriter::writeU64(uint64_t v) {
-    writeRaw(&v, 8);
+uint64_t BagWriter::tellPosition(const char* operation) {
+    ensureStreamGood(operation);
+    const std::streampos position = file_.tellp();
+    if (position == std::streampos(-1)) {
+        throw std::runtime_error(std::string("[BagWriter] ") + operation +
+                                 " failed: " + filepath_);
+    }
+    return static_cast<uint64_t>(position);
+}
+
+void BagWriter::seekPosition(std::streamoff offset, const char* operation) {
+    ensureStreamGood(operation);
+    file_.seekp(offset);
+    ensureStreamGood(operation);
+}
+
+void BagWriter::ensureStreamGood(const char* operation) const {
+    if (!file_.is_open() || !file_) {
+        throw std::runtime_error(std::string("[BagWriter] ") + operation +
+                                 " failed: " + filepath_);
+    }
+}
+
+void BagWriter::closeFileNoThrow() noexcept {
+    if (!file_.is_open()) return;
+    file_.clear();
+    file_.close();
+}
+
+void BagWriter::invokeIoHook(const char* operation) {
+    if (io_hook_) io_hook_(operation);
 }
 
 // Encode a field as [field_len:u32][key=value]
@@ -41,30 +85,57 @@ static std::vector<uint8_t> encodeField(const std::string& key, const std::strin
     return result;
 }
 
-// Encode a field with raw byte value (for op field)
-static std::vector<uint8_t> encodeFieldRaw(const std::string& key, const void* value, size_t value_len) {
-    std::string key_eq = key + "=";
-    uint32_t field_len = static_cast<uint32_t>(key_eq.size() + value_len);
-    std::vector<uint8_t> result(4 + field_len);
-    memcpy(result.data(), &field_len, 4);
-    memcpy(result.data() + 4, key_eq.data(), key_eq.size());
-    memcpy(result.data() + 4 + key_eq.size(), value, value_len);
+template <typename T>
+static std::string rawFieldValue(T value) {
+    std::string result(sizeof(T), '\0');
+    memcpy(result.data(), &value, sizeof(T));
     return result;
 }
 
-void BagWriter::writeRecordHeader(const std::vector<std::pair<std::string, std::string>>& fields,
-                                   uint32_t data_len) {
-    // Build header bytes
+static std::string rosTimeFieldValue(uint64_t time_ns) {
+    const uint64_t sec64 = time_ns / 1000000000ULL;
+    if (sec64 > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("[BagWriter] ROS time seconds overflow uint32");
+    }
+    const uint32_t sec = static_cast<uint32_t>(sec64);
+    const uint32_t nsec = static_cast<uint32_t>(time_ns % 1000000000ULL);
+    std::string result(2 * sizeof(uint32_t), '\0');
+    memcpy(result.data(), &sec, sizeof(sec));
+    memcpy(result.data() + sizeof(sec), &nsec, sizeof(nsec));
+    return result;
+}
+
+static void appendRosTime(std::vector<uint8_t>& output, uint64_t time_ns) {
+    const std::string encoded = rosTimeFieldValue(time_ns);
+    output.insert(output.end(), encoded.begin(), encoded.end());
+}
+
+static std::vector<uint8_t> encodeFileHeader(
+    uint64_t index_pos, uint32_t connection_count, uint32_t chunk_count) {
+    const uint8_t op = 0x03; // FILE_HEADER
+    const std::vector<std::pair<std::string, std::string>> fields = {
+        {"op", rawFieldValue(op)},
+        {"index_pos", rawFieldValue(index_pos)},
+        {"conn_count", rawFieldValue(connection_count)},
+        {"chunk_count", rawFieldValue(chunk_count)},
+    };
     std::vector<uint8_t> header;
-    for (const auto& f : fields) {
-        auto encoded = encodeField(f.first, f.second);
+    for (const auto& field : fields) {
+        const auto encoded = encodeField(field.first, field.second);
         header.insert(header.end(), encoded.begin(), encoded.end());
     }
+    return header;
+}
 
-    // Write header_len + header + data_len
-    writeU32(static_cast<uint32_t>(header.size()));
-    writeRaw(header.data(), header.size());
-    writeU32(data_len);
+static uint32_t fileHeaderPaddingSize(size_t header_size) {
+    // ROS rosbag_storage defines FILE_HEADER_LENGTH as header bytes plus data
+    // padding; the two uint32 length prefixes are outside that reservation.
+    constexpr size_t kFileHeaderContentSize = 4096;
+    if (header_size > kFileHeaderContentSize) {
+        throw std::overflow_error("[BagWriter] FILE_HEADER exceeds reserved size");
+    }
+    return static_cast<uint32_t>(
+        kFileHeaderContentSize - header_size);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -73,19 +144,25 @@ void BagWriter::writeRecordHeader(const std::vector<std::pair<std::string, std::
 
 bool BagWriter::open(const std::string& filepath) {
     filepath_ = filepath;
+    file_.clear();
     file_.open(filepath, std::ios::binary | std::ios::trunc);
     if (!file_.is_open()) {
         std::cerr << "[BagWriter] Cannot open: " << filepath << std::endl;
         return false;
     }
 
-    // Write version line
-    const char* version = "#ROSBAG V2.0\n";
-    writeRaw(version, strlen(version));
+    try {
+        // Write version line
+        const char* version = "#ROSBAG V2.0\n";
+        writeRaw(version, strlen(version));
 
-    // Write placeholder BAG_HEADER (will be rewritten on close)
-    // The BAG_HEADER data is padded to 4096 bytes total
-    writeFileHeader();
+        // Write placeholder BAG_HEADER (will be rewritten on close)
+        // The BAG_HEADER data is padded to 4096 bytes total
+        writeFileHeader();
+    } catch (...) {
+        closeFileNoThrow();
+        throw;
+    }
 
     std::cout << "[BagWriter] Opened: " << filepath << std::endl;
     return true;
@@ -94,34 +171,22 @@ bool BagWriter::open(const std::string& filepath) {
 void BagWriter::writeFileHeader() {
     // We'll write a placeholder; the real values are written in close()
     // For now, just reserve space (4096 bytes total for the header record)
-    uint64_t start_pos = static_cast<uint64_t>(file_.tellp());
+    uint64_t start_pos = tellPosition("tell initial header position");
 
-    // Build header fields
-    uint8_t op = 0x03; // FILE_HEADER
-    std::vector<std::pair<std::string, std::string>> fields;
-    fields.push_back({"op", std::string(1, static_cast<char>(op))});
-    fields.push_back({"index_pos", "0"});      // placeholder
-    fields.push_back({"conn_count", "0"});      // placeholder
-    fields.push_back({"chunk_count", "0"});     // placeholder
+    const std::vector<uint8_t> header = encodeFileHeader(0, 0, 0);
+    const uint32_t padding_size = fileHeaderPaddingSize(header.size());
 
-    // Build header bytes
-    std::vector<uint8_t> header;
-    for (const auto& f : fields) {
-        auto encoded = encodeField(f.first, f.second);
-        header.insert(header.end(), encoded.begin(), encoded.end());
-    }
-
-    // Write: header_len + header + data_len(0)
+    // Header bytes plus its data padding are exactly 4096 bytes, matching ROS
+    // bag v2. The two uint32 length prefixes make the complete record 4104
+    // bytes, and data_len lets a normal reader advance without a fixed seek.
     writeU32(static_cast<uint32_t>(header.size()));
     writeRaw(header.data(), header.size());
-    writeU32(0); // data_len = 0 for FILE_HEADER
-
-    // Pad to 4096 bytes
-    uint64_t current_pos = static_cast<uint64_t>(file_.tellp());
-    uint64_t header_end = start_pos + 4096;
-    if (current_pos < header_end) {
-        std::vector<char> padding(header_end - current_pos, 0);
-        writeRaw(padding.data(), padding.size());
+    writeU32(padding_size);
+    std::vector<char> padding(padding_size, ' ');
+    writeRaw(padding.data(), padding.size());
+    const uint64_t end_pos = tellPosition("tell padded header position");
+    if (end_pos != start_pos + 4096 + 2 * sizeof(uint32_t)) {
+        throw std::runtime_error("[BagWriter] FILE_HEADER padding size mismatch");
     }
 }
 
@@ -129,42 +194,49 @@ void BagWriter::close() {
     if (!file_.is_open()) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
+    try {
+        invokeIoHook("close");
+        // Flush remaining chunk
+        if (!chunk_buffer_.empty()) {
+            flushChunk();
+        }
 
-    // Flush remaining chunk
-    if (!chunk_buffer_.empty()) {
-        flushChunk();
+        // Record the index position (where CONNECTION records start)
+        uint64_t index_pos = tellPosition("tell index position");
+
+        // Write CONNECTION records
+        writeConnectionRecords();
+
+        // Write CHUNK_INFO records
+        writeChunkInfoRecords();
+
+        // Rewrite BAG_HEADER with correct values
+        seekPosition(13, "seek file header"); // After "#ROSBAG V2.0\n"
+
+        if (connections_.size() > std::numeric_limits<uint32_t>::max() ||
+            chunk_records_.size() > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("[BagWriter] FILE_HEADER count overflow");
+        }
+        const std::vector<uint8_t> header = encodeFileHeader(
+            index_pos, static_cast<uint32_t>(connections_.size()),
+            static_cast<uint32_t>(chunk_records_.size()));
+
+        writeU32(static_cast<uint32_t>(header.size()));
+        writeRaw(header.data(), header.size());
+        // Preserve the original padding data; only its length field needs to
+        // be rewritten alongside the fixed-size header.
+        writeU32(fileHeaderPaddingSize(header.size()));
+
+        file_.flush();
+        ensureStreamGood("flush");
+        file_.close();
+        if (file_.fail()) {
+            throw std::runtime_error("[BagWriter] close failed: " + filepath_);
+        }
+    } catch (...) {
+        closeFileNoThrow();
+        throw;
     }
-
-    // Record the index position (where CONNECTION records start)
-    uint64_t index_pos = static_cast<uint64_t>(file_.tellp());
-
-    // Write CONNECTION records
-    writeConnectionRecords();
-
-    // Write CHUNK_INFO records
-    writeChunkInfoRecords();
-
-    // Rewrite BAG_HEADER with correct values
-    file_.seekp(13); // After "#ROSBAG V2.0\n"
-
-    uint8_t op = 0x03;
-    std::vector<std::pair<std::string, std::string>> fields;
-    fields.push_back({"op", std::string(1, static_cast<char>(op))});
-    fields.push_back({"index_pos", std::to_string(index_pos)});
-    fields.push_back({"conn_count", std::to_string(connections_.size())});
-    fields.push_back({"chunk_count", std::to_string(chunk_records_.size())});
-
-    std::vector<uint8_t> header;
-    for (const auto& f : fields) {
-        auto encoded = encodeField(f.first, f.second);
-        header.insert(header.end(), encoded.begin(), encoded.end());
-    }
-
-    writeU32(static_cast<uint32_t>(header.size()));
-    writeRaw(header.data(), header.size());
-    writeU32(0); // data_len = 0
-
-    file_.close();
     std::cout << "[BagWriter] Closed: " << filepath_
               << " (chunks=" << chunk_records_.size()
               << ", connections=" << connections_.size() << ")" << std::endl;
@@ -179,6 +251,7 @@ uint32_t BagWriter::addConnection(const std::string& topic,
                                    const std::string& md5sum,
                                    const std::string& msg_def) {
     std::lock_guard<std::mutex> lock(mutex_);
+    ensureStreamGood("add connection");
     uint32_t id = next_conn_id_++;
     ConnectionInfo conn;
     conn.conn_id = id;
@@ -197,28 +270,13 @@ uint32_t BagWriter::addConnection(const std::string& topic,
 
 void BagWriter::appendMsgToChunk(uint32_t conn_id, uint64_t time_ns,
                                   const uint8_t* data, size_t len) {
+    if (len > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("[BagWriter] message exceeds ROS bag record limit");
+    }
     // MSG_DATA sub-record within chunk:
     // [header_len:u32][op(1B) + conn(4B) + time(8B)][data_len:u32][message_data]
 
-    // Build sub-header
     std::vector<uint8_t> sub_header;
-    // op field: 1 byte
-    uint8_t op = 0x02; // MSG_DATA
-    sub_header.push_back(op);
-    // conn field: 4 bytes
-    sub_header.insert(sub_header.end(),
-                      reinterpret_cast<uint8_t*>(&conn_id),
-                      reinterpret_cast<uint8_t*>(&conn_id) + 4);
-    // time field: 8 bytes
-    sub_header.insert(sub_header.end(),
-                      reinterpret_cast<uint8_t*>(&time_ns),
-                      reinterpret_cast<uint8_t*>(&time_ns) + 8);
-
-    // But we need to encode as field=value format for sub-records too
-    // Actually in chunk sub-records, the header uses the same format:
-    // [field_len:u32][key=value] for each field
-    // Let me re-encode properly:
-    sub_header.clear();
 
     // op = 0x02 as raw byte
     {
@@ -240,7 +298,7 @@ void BagWriter::appendMsgToChunk(uint32_t conn_id, uint64_t time_ns,
         memcpy(sub_header.data() + old_size + 4, key_eq.data(), key_eq.size());
         memcpy(sub_header.data() + old_size + 4 + key_eq.size(), &conn_id, 4);
     }
-    // time = time_ns as 8-byte raw
+    // ROS time is two little-endian uint32 values: seconds, nanoseconds.
     {
         std::string key_eq = "time=";
         uint32_t fl = static_cast<uint32_t>(key_eq.size() + 8);
@@ -248,7 +306,9 @@ void BagWriter::appendMsgToChunk(uint32_t conn_id, uint64_t time_ns,
         sub_header.resize(old_size + 4 + fl);
         memcpy(sub_header.data() + old_size, &fl, 4);
         memcpy(sub_header.data() + old_size + 4, key_eq.data(), key_eq.size());
-        memcpy(sub_header.data() + old_size + 4 + key_eq.size(), &time_ns, 8);
+        const std::string encoded_time = rosTimeFieldValue(time_ns);
+        memcpy(sub_header.data() + old_size + 4 + key_eq.size(),
+               encoded_time.data(), encoded_time.size());
     }
 
     uint32_t offset = static_cast<uint32_t>(chunk_buffer_.size());
@@ -277,17 +337,19 @@ void BagWriter::appendMsgToChunk(uint32_t conn_id, uint64_t time_ns,
     // Update chunk time range
     if (chunk_messages_.size() == 1) {
         chunk_start_time_ = time_ns;
+        chunk_end_time_ = time_ns;
+    } else {
+        chunk_start_time_ = std::min(chunk_start_time_, time_ns);
+        chunk_end_time_ = std::max(chunk_end_time_, time_ns);
     }
-    chunk_end_time_ = time_ns;
 
-    // Update global index
-    connection_index_[conn_id].push_back({time_ns, offset});
 }
 
 void BagWriter::writeMessage(uint32_t conn_id, uint64_t time_ns,
                               const uint8_t* data, size_t len) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!file_.is_open()) return;
+    ensureStreamGood("write message");
+    invokeIoHook("write_message");
 
     appendMsgToChunk(conn_id, time_ns, data, len);
 
@@ -304,14 +366,18 @@ void BagWriter::writeMessage(uint32_t conn_id, uint64_t time_ns,
 void BagWriter::flushChunk() {
     if (chunk_buffer_.empty()) return;
 
-    uint64_t chunk_file_pos = static_cast<uint64_t>(file_.tellp());
+    uint64_t chunk_file_pos = tellPosition("tell chunk position");
+    if (chunk_buffer_.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("[BagWriter] chunk exceeds ROS bag uint32 limit");
+    }
+    const uint32_t chunk_size = static_cast<uint32_t>(chunk_buffer_.size());
 
     // Write CHUNK record header
     uint8_t op = 0x05; // CHUNK
     std::vector<std::pair<std::string, std::string>> fields;
     fields.push_back({"op", std::string(1, static_cast<char>(op))});
     fields.push_back({"compression", "none"});
-    fields.push_back({"size", std::to_string(chunk_buffer_.size())});
+    fields.push_back({"size", rawFieldValue(chunk_size)});
 
     std::vector<uint8_t> header;
     for (const auto& f : fields) {
@@ -321,7 +387,7 @@ void BagWriter::flushChunk() {
 
     writeU32(static_cast<uint32_t>(header.size()));
     writeRaw(header.data(), header.size());
-    writeU32(static_cast<uint32_t>(chunk_buffer_.size()));
+    writeU32(chunk_size);
     writeRaw(chunk_buffer_.data(), chunk_buffer_.size());
 
     // Write INDEX_DATA records for each connection in this chunk
@@ -338,13 +404,18 @@ void BagWriter::flushChunk() {
 
     for (const auto& pair : chunk_conn_index) {
         uint32_t conn_id = pair.first;
-        const auto& entries = pair.second;
+        auto entries = pair.second;
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return lhs.first < rhs.first ||
+                             (lhs.first == rhs.first && lhs.second < rhs.second);
+                  });
 
         // INDEX_DATA header
         std::vector<std::pair<std::string, std::string>> idx_fields;
         uint8_t idx_op = 0x04; // INDEX_DATA
         idx_fields.push_back({"op", std::string(1, static_cast<char>(idx_op))});
-        idx_fields.push_back({"ver", "1"});
+        idx_fields.push_back({"ver", rawFieldValue(uint32_t{1})});
 
         // conn as 4-byte raw
         std::string conn_val(4, '\0');
@@ -363,14 +434,11 @@ void BagWriter::flushChunk() {
             idx_header.insert(idx_header.end(), encoded.begin(), encoded.end());
         }
 
-        // INDEX_DATA data: count × (time:u64, offset:u32)
+        // INDEX_DATA data: count entries of (time: sec+nsec, offset:u32).
         std::vector<uint8_t> idx_data;
         for (const auto& e : entries) {
-            uint64_t t = e.first;
             uint32_t o = e.second;
-            idx_data.insert(idx_data.end(),
-                           reinterpret_cast<uint8_t*>(&t),
-                           reinterpret_cast<uint8_t*>(&t) + 8);
+            appendRosTime(idx_data, e.first);
             idx_data.insert(idx_data.end(),
                            reinterpret_cast<uint8_t*>(&o),
                            reinterpret_cast<uint8_t*>(&o) + 4);
@@ -449,7 +517,7 @@ void BagWriter::writeChunkInfoRecords() {
         std::vector<std::pair<std::string, std::string>> fields;
         uint8_t op = 0x06; // CHUNK_INFO
         fields.push_back({"op", std::string(1, static_cast<char>(op))});
-        fields.push_back({"ver", "1"});
+        fields.push_back({"ver", rawFieldValue(uint32_t{1})});
 
         // chunk_pos as 8-byte raw
         std::string pos_val(8, '\0');
@@ -457,20 +525,10 @@ void BagWriter::writeChunkInfoRecords() {
         fields.push_back({"chunk_pos", pos_val});
 
         // start_time as 8-byte raw (sec + nsec)
-        uint32_t start_sec = static_cast<uint32_t>(chunk.start_time_ns / 1000000000ULL);
-        uint32_t start_nsec = static_cast<uint32_t>(chunk.start_time_ns % 1000000000ULL);
-        std::string start_val(8, '\0');
-        memcpy(&start_val[0], &start_sec, 4);
-        memcpy(&start_val[4], &start_nsec, 4);
-        fields.push_back({"start_time", start_val});
+        fields.push_back({"start_time", rosTimeFieldValue(chunk.start_time_ns)});
 
         // end_time as 8-byte raw
-        uint32_t end_sec = static_cast<uint32_t>(chunk.end_time_ns / 1000000000ULL);
-        uint32_t end_nsec = static_cast<uint32_t>(chunk.end_time_ns % 1000000000ULL);
-        std::string end_val(8, '\0');
-        memcpy(&end_val[0], &end_sec, 4);
-        memcpy(&end_val[4], &end_nsec, 4);
-        fields.push_back({"end_time", end_val});
+        fields.push_back({"end_time", rosTimeFieldValue(chunk.end_time_ns)});
 
         // count as 4-byte raw
         uint32_t count = static_cast<uint32_t>(chunk.conn_counts.size());
@@ -532,6 +590,7 @@ void BagWriter::writeOdometry(uint64_t time_ns,
             return;
         }
     }
+    throw std::runtime_error("[BagWriter] odometry connection is not registered");
 }
 
 void BagWriter::writePointCloud(uint64_t time_ns,
@@ -555,6 +614,8 @@ void BagWriter::writePointCloud(uint64_t time_ns,
             return;
         }
     }
+    throw std::runtime_error("[BagWriter] point cloud connection is not registered: " +
+                             topic);
 }
 
 void BagWriter::writePath(uint64_t time_ns,
@@ -577,6 +638,7 @@ void BagWriter::writePath(uint64_t time_ns,
             return;
         }
     }
+    throw std::runtime_error("[BagWriter] path connection is not registered");
 }
 
 void BagWriter::writeTF(uint64_t time_ns,
@@ -603,4 +665,5 @@ void BagWriter::writeTF(uint64_t time_ns,
             return;
         }
     }
+    throw std::runtime_error("[BagWriter] TF connection is not registered");
 }

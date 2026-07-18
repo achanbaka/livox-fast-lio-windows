@@ -4,11 +4,31 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
+#include <exception>
+#include <stdexcept>
+#include <utility>
 
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr size_t kHeaderSize = kLivoxPacketHeaderSize;
+
+template <typename Function>
+class ScopeExit {
+public:
+    explicit ScopeExit(Function function) : function_(std::move(function)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() noexcept { function_(); }
+
+private:
+    Function function_;
+};
+
+template <typename Function>
+ScopeExit<Function> makeScopeExit(Function function) {
+    return ScopeExit<Function>(std::move(function));
+}
 
 template <typename T>
 T readScalar(const uint8_t* data) {
@@ -200,13 +220,76 @@ LvxReader::LvxReader()
 {
 }
 
+LvxReader::PlaybackStats LvxReader::playbackStats() const
+{
+    PlaybackStats result;
+    std::lock_guard<std::mutex> lock(thread_state_mutex_);
+    result.failures = playback_failure_count_.load();
+    result.failed = playback_failed_.load();
+    result.eof = eof_.load();
+    result.playing = playing_.load();
+    result.thread_exited = playback_thread_exited_.load();
+    size_t length = 0;
+    while (length < kMaxPlaybackErrorLength && last_playback_error_[length] != '\0') {
+        ++length;
+    }
+    result.last_error.assign(last_playback_error_.data(), length);
+    return result;
+}
+
+void LvxReader::clearPlaybackFailure()
+{
+    std::lock_guard<std::mutex> lock(thread_state_mutex_);
+    last_playback_error_[0] = '\0';
+    playback_failed_ = false;
+}
+
+void LvxReader::recordPlaybackFailure(const char* message) noexcept
+{
+    try {
+        std::lock_guard<std::mutex> lock(thread_state_mutex_);
+        const char* source = message ? message : "unknown playback exception";
+        size_t length = 0;
+        while (length < kMaxPlaybackErrorLength && source[length] != '\0') {
+            last_playback_error_[length] = source[length];
+            ++length;
+        }
+        last_playback_error_[length] = '\0';
+        playback_failure_count_.fetch_add(1);
+        playback_failed_ = true;
+    } catch (...) {
+        // Failure reporting must never escape the std::thread exception
+        // boundary. The atomic failure fields remain available even if the
+        // diagnostic mutex itself cannot be acquired.
+        playback_failure_count_.fetch_add(1);
+        playback_failed_ = true;
+    }
+}
+
+void LvxReader::finishPlaybackThread(bool reached_eof) noexcept
+{
+    try {
+        std::lock_guard<std::mutex> lock(thread_state_mutex_);
+        playing_ = false;
+        eof_ = reached_eof && !playback_failed_.load();
+        playback_thread_exited_ = true;
+    } catch (...) {
+        // The flag is atomic so stopFor() can still observe completion even
+        // in the exceptional mutex-failure path.
+        playing_ = false;
+        eof_ = reached_eof && !playback_failed_.load();
+        playback_thread_exited_ = true;
+    }
+    thread_exit_cv_.notify_all();
+}
+
 LvxReader::~LvxReader()
 {
     close();
 }
 
-bool LvxReader::open(const std::string& filepath)
-{
+bool LvxReader::open(const std::string& filepath) noexcept
+try {
     filepath_ = filepath;
     file_.open(filepath, std::ios::binary);
     if (!file_.is_open())
@@ -346,6 +429,23 @@ bool LvxReader::open(const std::string& filepath)
               << (int)private_header_.device_count << " devices)"
               << std::endl;
     return true;
+} catch (const std::exception& error) {
+    recordPlaybackFailure(error.what());
+    try {
+        if (file_.is_open()) file_.close();
+        std::cerr << "[LvxReader] Open failed: " << error.what() << std::endl;
+    } catch (...) {
+    }
+    return false;
+} catch (...) {
+    recordPlaybackFailure("unknown exception while opening LVX file");
+    try {
+        if (file_.is_open()) file_.close();
+        std::cerr << "[LvxReader] Open failed with an unknown exception"
+                  << std::endl;
+    } catch (...) {
+    }
+    return false;
 }
 
 void LvxReader::close()
@@ -355,15 +455,39 @@ void LvxReader::close()
         file_.close();
 }
 
-void LvxReader::play(double speed)
+void LvxReader::play(double speed) noexcept
 {
+    try {
     if (!file_.is_open()) return;
+    // Reap a naturally completed previous playback before replacing the
+    // std::thread object.
+    stop();
     stop_flag_ = false;
     paused_ = false;
+    eof_ = false;
+    clearPlaybackFailure();
     playback_speed_ = speed;
     playing_ = true;
-
-    playback_thread_ = std::thread(&LvxReader::playbackThread, this);
+    {
+        std::lock_guard<std::mutex> lock(thread_state_mutex_);
+        playback_thread_exited_ = false;
+    }
+    try {
+        playback_thread_ = std::thread(&LvxReader::playbackThread, this);
+    } catch (const std::exception& error) {
+        recordPlaybackFailure(error.what());
+        finishPlaybackThread(false);
+    } catch (...) {
+        recordPlaybackFailure("unknown exception while starting playback thread");
+        finishPlaybackThread(false);
+    }
+    } catch (const std::exception& error) {
+        recordPlaybackFailure(error.what());
+        finishPlaybackThread(false);
+    } catch (...) {
+        recordPlaybackFailure("unknown exception while preparing LVX playback");
+        finishPlaybackThread(false);
+    }
 }
 
 void LvxReader::setSpeed(double speed)
@@ -412,70 +536,121 @@ bool LvxReader::seekToTimeNs(uint64_t time_ns)
     return true;
 }
 
+bool LvxReader::stopFor(std::chrono::milliseconds timeout)
+{
+    stop_flag_ = true;
+    paused_ = false;
+    pause_cv_.notify_all();
+    if (!playback_thread_.joinable()) {
+        playing_ = false;
+        return true;
+    }
+    {
+        std::unique_lock<std::mutex> lock(thread_state_mutex_);
+        if (!thread_exit_cv_.wait_for(lock, timeout, [this] {
+                return playback_thread_exited_.load();
+            })) {
+            return false;
+        }
+    }
+    playback_thread_.join();
+    playing_ = false;
+    return true;
+}
+
 void LvxReader::stop()
 {
     stop_flag_ = true;
     paused_ = false;
     pause_cv_.notify_all();
-    if (playback_thread_.joinable())
-        playback_thread_.join();
+    if (playback_thread_.joinable()) playback_thread_.join();
     playing_ = false;
 }
 
-void LvxReader::playbackThread()
+void LvxReader::playbackThread() noexcept
 {
-    auto last_frame_wall = std::chrono::steady_clock::now();
+    bool reached_eof = eof_.load();
+    auto exit_guard = makeScopeExit([this, &reached_eof]() noexcept {
+        finishPlaybackThread(reached_eof);
+    });
 
-    while (!stop_flag_ && !eof_)
-    {
-        // Check pause
-        {
-            std::unique_lock<std::mutex> lock(pause_mutex_);
-            pause_cv_.wait(lock, [this]{ return !paused_ || stop_flag_; });
-        }
-        if (stop_flag_) break;
+    try {
+        auto last_frame_wall = std::chrono::steady_clock::now();
 
-        if (!readFrame())
+        while (!stop_flag_ && !eof_)
         {
-            eof_ = true;
-            break;
-        }
+            // Check pause
+            {
+                std::unique_lock<std::mutex> lock(pause_mutex_);
+                pause_cv_.wait(lock, [this]{ return !paused_ || stop_flag_; });
+            }
+            if (stop_flag_) break;
 
-        // Throttle: sleep for frame_duration minus time spent reading
-        auto now = std::chrono::steady_clock::now();
-        auto read_time = std::chrono::duration<double, std::milli>(now - last_frame_wall).count();
-        const double speed = playback_speed_.load();
-        const double target_frame_ms =
-            speed > 0.0 ? static_cast<double>(frame_duration_ms_) / speed : 0.0;
-        double sleep_ms = target_frame_ms - read_time;
-        if (sleep_ms > 1.0 && sleep_ms < 500.0)
-        {
-            if (!sleepInterruptible(std::chrono::milliseconds((int)sleep_ms))) {
+            bool has_frame_remaining = false;
+            {
+                std::lock_guard<std::mutex> lock(control_mutex_);
+                has_frame_remaining = current_frame_ < total_frames_;
+            }
+            if (!has_frame_remaining) {
+                reached_eof = true;
                 break;
             }
-        }
-        last_frame_wall = std::chrono::steady_clock::now();
-    }
 
-    playing_ = false;
-    if (eof_)
-    {
-        std::cout << "[LvxReader] Playback finished (EOF)" << std::endl;
-        if (!seen_points_)
-        {
-            std::cerr << "[LvxReader] ERROR: no supported Livox SDK1 LVX v1.1 point packets were parsed."
-                      << std::endl;
+            if (!readFrame())
+            {
+                throw std::runtime_error(
+                    "failed to read a validated LVX frame");
+            }
+
+            // Throttle: sleep for frame_duration minus time spent reading
+            auto now = std::chrono::steady_clock::now();
+            auto read_time = std::chrono::duration<double, std::milli>(now - last_frame_wall).count();
+            const double speed = playback_speed_.load();
+            const double target_frame_ms =
+                speed > 0.0 ? static_cast<double>(frame_duration_ms_) / speed : 0.0;
+            double sleep_ms = target_frame_ms - read_time;
+            if (sleep_ms > 1.0 && sleep_ms < 500.0)
+            {
+                if (!sleepInterruptible(std::chrono::milliseconds((int)sleep_ms))) {
+                    break;
+                }
+            }
+            last_frame_wall = std::chrono::steady_clock::now();
         }
-        if (!seen_imu_)
+
+        if (reached_eof)
         {
-            std::cerr << "[LvxReader] ERROR: no IMU packets were parsed; FAST-LIO LiDAR/IMU mapping cannot run."
-                      << std::endl;
+            std::cout << "[LvxReader] Playback finished (EOF)" << std::endl;
+            if (!seen_points_)
+            {
+                std::cerr << "[LvxReader] ERROR: no supported Livox SDK1 LVX v1.1 point packets were parsed."
+                          << std::endl;
+            }
+            if (!seen_imu_)
+            {
+                std::cerr << "[LvxReader] ERROR: no IMU packets were parsed; FAST-LIO LiDAR/IMU mapping cannot run."
+                          << std::endl;
+            }
+            if (unsupported_packet_count_ > 0 || truncated_packet_count_ > 0)
+            {
+                std::cerr << "[LvxReader] Packet diagnostics: unsupported="
+                          << unsupported_packet_count_
+                          << " truncated=" << truncated_packet_count_ << std::endl;
+            }
         }
-        if (unsupported_packet_count_ > 0 || truncated_packet_count_ > 0)
-        {
-            std::cerr << "[LvxReader] Packet diagnostics: unsupported="
-                      << unsupported_packet_count_
-                      << " truncated=" << truncated_packet_count_ << std::endl;
+    } catch (const std::exception& error) {
+        reached_eof = false;
+        recordPlaybackFailure(error.what());
+        try {
+            std::cerr << "[LvxReader] Playback failed: " << error.what() << std::endl;
+        } catch (...) {
+        }
+    } catch (...) {
+        reached_eof = false;
+        recordPlaybackFailure("unknown playback exception");
+        try {
+            std::cerr << "[LvxReader] Playback failed with an unknown exception" << std::endl;
+        } catch (...) {
         }
     }
 }
@@ -538,10 +713,13 @@ bool LvxReader::readFrame()
     // Read entire frame data
     std::vector<uint8_t> frame_data(data_size);
     file_.read(reinterpret_cast<char*>(frame_data.data()), data_size);
-    if (!file_.good())
+    const std::streamsize bytes_read = file_.gcount();
+    if (file_.bad() ||
+        bytes_read != static_cast<std::streamsize>(data_size))
     {
-        if (file_.gcount() <= 0) return false;
-        frame_data.resize(file_.gcount());
+        std::cerr << "[LvxReader] readFrame: short payload read, expected="
+                  << data_size << " actual=" << bytes_read << std::endl;
+        return false;
     }
 
     // Parse frame data into points and IMU samples

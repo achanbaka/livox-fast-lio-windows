@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include <array>
 #include "types.h"
@@ -45,9 +46,11 @@ private:
 
 class RosDeserializer {
 public:
-    RosDeserializer() : data_(nullptr), len_(0), pos_(0) {}
-    RosDeserializer(const uint8_t* data, size_t len) : data_(data), len_(len), pos_(0) {}
-    RosDeserializer(const std::vector<uint8_t>& buf) : data_(buf.data()), len_(buf.size()), pos_(0) {}
+    RosDeserializer() : data_(nullptr), len_(0), pos_(0), good_(true) {}
+    RosDeserializer(const uint8_t* data, size_t len)
+        : data_(data), len_(len), pos_(0), good_(true) {}
+    RosDeserializer(const std::vector<uint8_t>& buf)
+        : data_(buf.data()), len_(buf.size()), pos_(0), good_(true) {}
 
     uint8_t readUint8()   { return readRawT<uint8_t>(); }
     uint32_t readUint32() { return readRawT<uint32_t>(); }
@@ -57,7 +60,10 @@ public:
 
     std::string readString() {
         uint32_t len = readUint32();
-        if (pos_ + len > len_) return "";
+        if (!good_ || len > remaining()) {
+            good_ = false;
+            return "";
+        }
         std::string s(reinterpret_cast<const char*>(data_ + pos_), len);
         pos_ += len;
         return s;
@@ -69,20 +75,33 @@ public:
     }
 
     void readRaw(void* dst, size_t len) {
-        if (pos_ + len > len_) return;
+        if (len > remaining()) {
+            good_ = false;
+            return;
+        }
         memcpy(dst, data_ + pos_, len);
         pos_ += len;
     }
 
-    void skip(size_t bytes) { pos_ += bytes; }
+    void skip(size_t bytes) {
+        if (bytes > remaining()) {
+            pos_ = len_;
+            good_ = false;
+            return;
+        }
+        pos_ += bytes;
+    }
     size_t remaining() const { return (pos_ < len_) ? (len_ - pos_) : 0; }
     size_t tell() const { return pos_; }
-    bool good() const { return pos_ <= len_; }
+    bool good() const { return good_ && pos_ <= len_; }
 
 private:
     template<typename T>
     T readRawT() {
-        if (pos_ + sizeof(T) > len_) return T{};
+        if (sizeof(T) > remaining()) {
+            good_ = false;
+            return T{};
+        }
         T v;
         memcpy(&v, data_ + pos_, sizeof(T));
         pos_ += sizeof(T);
@@ -92,6 +111,7 @@ private:
     const uint8_t* data_;
     size_t len_;
     size_t pos_;
+    bool good_;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -150,9 +170,15 @@ struct LivoxCustomMsg {
         msg.rsvd[1] = d.readUint8();
         msg.rsvd[2] = d.readUint8();
         // Array: uint32 length prefix + data
-        uint32_t arr_len = d.readUint32(); // byte length of array
-        msg.points.resize(msg.point_num);
-        for (uint32_t i = 0; i < msg.point_num && d.good(); i++) {
+        const uint32_t arr_len = d.readUint32();
+        constexpr size_t kSerializedPointBytes =
+            sizeof(uint32_t) + 3 * sizeof(float) + 3 * sizeof(uint8_t);
+        if (!d.good() || arr_len != msg.point_num ||
+            static_cast<size_t>(arr_len) > d.remaining() / kSerializedPointBytes) {
+            throw std::runtime_error("invalid Livox CustomMsg point array");
+        }
+        msg.points.resize(arr_len);
+        for (uint32_t i = 0; i < arr_len; i++) {
             msg.points[i].offset_time = d.readUint32();
             msg.points[i].x = d.readFloat32();
             msg.points[i].y = d.readFloat32();
@@ -160,6 +186,9 @@ struct LivoxCustomMsg {
             msg.points[i].reflectivity = d.readUint8();
             msg.points[i].tag = d.readUint8();
             msg.points[i].line = d.readUint8();
+        }
+        if (!d.good()) {
+            throw std::runtime_error("truncated Livox CustomMsg point array");
         }
         return msg;
     }
@@ -342,7 +371,7 @@ inline std::vector<uint8_t> serializeTFMessage(
 namespace ros_msg_defs {
 
 const std::string POSE_STAMPED =
-    "PoseStamped\n"
+    "# A Pose with reference coordinate frame and timestamp\n"
     "Header header\n"
     "Pose pose\n"
     "================================================================================\n"
@@ -367,7 +396,6 @@ const std::string POSE_STAMPED =
     "float64 w\n";
 
 const std::string POINT_CLOUD2 =
-    "PointCloud2\n"
     "Header header\n"
     "uint32 height\n"
     "uint32 width\n"
@@ -384,13 +412,21 @@ const std::string POINT_CLOUD2 =
     "string frame_id\n"
     "================================================================================\n"
     "MSG: sensor_msgs/PointField\n"
+    "uint8 INT8=1\n"
+    "uint8 UINT8=2\n"
+    "uint8 INT16=3\n"
+    "uint8 UINT16=4\n"
+    "uint8 INT32=5\n"
+    "uint8 UINT32=6\n"
+    "uint8 FLOAT32=7\n"
+    "uint8 FLOAT64=8\n"
     "string name\n"
     "uint32 offset\n"
     "uint8 datatype\n"
     "uint32 count\n";
 
 const std::string POSE_ARRAY =
-    "PoseArray\n"
+    "# An array of poses with a header for global reference.\n"
     "Header header\n"
     "Pose[] poses\n"
     "================================================================================\n"
@@ -415,8 +451,7 @@ const std::string POSE_ARRAY =
     "string frame_id\n";
 
 const std::string TF_MESSAGE =
-    "TFMessage\n"
-    "TransformStamped[] transforms\n"
+    "geometry_msgs/TransformStamped[] transforms\n"
     "================================================================================\n"
     "MSG: geometry_msgs/TransformStamped\n"
     "Header header\n"
@@ -495,7 +530,7 @@ const std::string SENSOR_IMU =
 // MD5 sums (standard ROS values)
 const std::string POSE_STAMPED_MD5 = "d3812c3eb69e39177346ef37679b2065";
 const std::string POINT_CLOUD2_MD5 = "1155d3dc355119d6dd3256612b16c678";
-const std::string POSE_ARRAY_MD5   = "ec70a37549bd0647da92e875469a3cbe";
+const std::string POSE_ARRAY_MD5   = "916c28c5764443f268b296bb671b9d97";
 const std::string TF_MESSAGE_MD5   = "94810edda583a504dfda3824e5c96c1e";
 const std::string CUSTOM_MSG_MD5   = "c852fac30a094420cc56e73c57f4292e";
 const std::string SENSOR_IMU_MD5   = "a9c9cb14c2e80c6e3d624478e3a15b5c";

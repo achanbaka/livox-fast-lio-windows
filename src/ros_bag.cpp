@@ -74,6 +74,18 @@ uint64_t BagFileReader::getFieldU64(const FieldMap& f, const std::string& key,
     return def;
 }
 
+uint64_t BagFileReader::getFieldTimeNs(const FieldMap& f, const std::string& key,
+                                        uint64_t def) {
+    auto it = f.find(key);
+    if (it == f.end() || it->second.size() != 8) return def;
+    uint32_t sec = 0;
+    uint32_t nsec = 0;
+    memcpy(&sec, it->second.data(), sizeof(sec));
+    memcpy(&nsec, it->second.data() + sizeof(sec), sizeof(nsec));
+    if (nsec >= 1000000000U) return def;
+    return static_cast<uint64_t>(sec) * 1000000000ULL + nsec;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Record-level I/O
 // ═══════════════════════════════════════════════════════════════════════
@@ -155,8 +167,8 @@ bool BagFileReader::parseChunkInfo(const FieldMap& fields,
                                     const uint8_t* data, size_t data_len) {
     ChunkInfo ci;
     ci.chunk_pos  = getFieldU64(fields, "chunk_pos", 0);
-    ci.start_time = getFieldU64(fields, "start_time", 0);
-    ci.end_time   = getFieldU64(fields, "end_time", 0);
+    ci.start_time = getFieldTimeNs(fields, "start_time", 0);
+    ci.end_time   = getFieldTimeNs(fields, "end_time", 0);
 
     // Data: count × (conn:u32, count:u32)
     uint32_t count = getFieldU32(fields, "count", 0);
@@ -310,7 +322,7 @@ bool BagFileReader::processChunk(uint64_t chunk_file_pos, MessageCallback callba
         }
         else if (sub_op == OP_MSG_DATA) {
             uint32_t conn_id = getFieldU32(sub_fields, "conn", 0);
-            uint64_t time_ns = getFieldU64(sub_fields, "time", 0);
+            uint64_t time_ns = getFieldTimeNs(sub_fields, "time", 0);
 
             if (filter_conn_id < 0 || static_cast<int32_t>(conn_id) == filter_conn_id) {
                 callback(conn_id, time_ns,
