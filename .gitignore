@@ -12,6 +12,7 @@ compile_commands.json
 # Local IDE/editor state
 .vs/
 .vscode/
+Shell/
 
 # Local planning/docs not published to GitHub
 docs/
